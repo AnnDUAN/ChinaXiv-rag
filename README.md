@@ -1,6 +1,6 @@
-# agentic_rag 第一版
+# ChinaXiv-rag
 
-> GitHub：https://github.com/AnnDUAN/agentic-rag
+> GitHub：https://github.com/AnnDUAN/ChinaXiv-rag
 >
 > 仓库不包含 `data/` 下的 PDF、解析结果、切片、索引和本地模型；按下方命令重新生成即可。
 
