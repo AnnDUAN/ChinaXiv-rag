@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+
+# 数据、索引和本地模型体积较大，且包含论文原文，不进入 Git 仓库
+data/*
+!data/README.md
+
+# 本地大模型配置可能包含 API Key，只提交示例文件
+config/llm.json
+
+# 个人简历和临时文件
+*.docx
+*.pdf
+~$*
+*.log

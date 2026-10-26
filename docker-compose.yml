@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: agentic-rag-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agentic_rag
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+    ports:
+      - "55433:5432"
+    volumes:
+      - ./data/pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d agentic_rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

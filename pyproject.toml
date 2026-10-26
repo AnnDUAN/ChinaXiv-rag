@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-rag"
+version = "0.1.0"
+description = "Local paper RAG with PostgreSQL/pgvector, hybrid retrieval, rerank, structured Q&A and long-term memory"
+requires-python = ">=3.10"
+dependencies = [
+  "pymupdf>=1.24",
+  "jieba>=0.42",
+  "requests>=2.31",
+  "numpy>=1.26",
+  "fastembed>=0.4",
+  "openai>=1.40",
+  "pydantic>=2.7",
+  "psycopg[binary]>=3.1",
+  "pgvector>=0.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

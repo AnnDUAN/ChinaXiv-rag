@@ -1,0 +1,14 @@
+{
+  "base_url": "https://api.deepseek.com/v1",
+  "api_key": "你的 key",
+  "model": "deepseek-chat",
+  "timeout": 120,
+  "temperature": 0.2,
+  "capabilities": {
+    "json_schema": true,
+    "json_object": true,
+    "tool_calling": false,
+    "streaming": true,
+    "max_context": 32000
+  }
+}
