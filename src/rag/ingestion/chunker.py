@@ -4,11 +4,14 @@
 - 不跨章节切；
 - 尽量按句子边界切；
 - 每块 400～600 字，块之间留一点重叠；
+- 表格单独成块，保留 HTML 合并单元格，超长表格重复表头；
+- 公式跟相邻正文放一起，不生成只有公式的块；
 - 每块都记录论文、章节、页码、前后块，方便以后追溯。
 """
 
 from __future__ import annotations
 
+import html as html_module
 import json
 import re
 from pathlib import Path
@@ -17,13 +20,37 @@ from typing import Any
 from .. import config
 from ..common.utils import hard_split, split_sentences
 
+FORMULA_RE = re.compile(r"(\$\$.*?\$\$|\$[^$\n]+\$)", re.S)
 
-def _units_for_section(section: dict[str, Any]) -> list[dict[str, Any]]:
+
+def _protect_formulas(text: str, formulas: dict[str, str]) -> str:
+    """把公式换成短占位符，避免句号/长度切分把公式拦腰截断。"""
+
+    def repl(match: re.Match[str]) -> str:
+        key = f"[[F{len(formulas)}]]"
+        formulas[key] = match.group(1)
+        return key
+
+    return FORMULA_RE.sub(repl, text)
+
+
+def _restore_formulas(text: str, formulas: dict[str, str]) -> str:
+    for key, value in formulas.items():
+        text = text.replace(key, value)
+    return text
+
+
+def _units_for_paragraphs(
+    paragraphs: list[dict[str, Any]],
+    section: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
     units: list[dict[str, Any]] = []
-    for p_idx, para in enumerate(section.get("paragraphs", [])):
+    formulas: dict[str, str] = {}
+    for p_idx, para in enumerate(paragraphs):
         text = (para.get("text") or "").strip()
         if not text:
             continue
+        text = _protect_formulas(text, formulas)
         sentence_parts: list[str] = []
         for sent in split_sentences(text):
             sentence_parts.extend(hard_split(sent, config.CHUNK_MAX))
@@ -36,7 +63,7 @@ def _units_for_section(section: dict[str, Any]) -> list[dict[str, Any]]:
                     "new_para": s_idx == 0 and p_idx > 0,
                 }
             )
-    return units
+    return units, formulas
 
 
 def _join_units(units: list[dict[str, Any]]) -> str:
@@ -102,9 +129,14 @@ def _primary_chunks(units: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return merged
 
 
-def _text_units(text: str, page: int = 1) -> list[dict[str, Any]]:
+def _text_units(
+    text: str,
+    page: int = 1,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """把一段文字拆成句子单元，供摘要等单独内容复用。"""
     units: list[dict[str, Any]] = []
+    formulas: dict[str, str] = {}
+    text = _protect_formulas(text, formulas)
     for sent in split_sentences(text):
         for part in hard_split(sent, config.CHUNK_MAX):
             units.append(
@@ -115,7 +147,7 @@ def _text_units(text: str, page: int = 1) -> list[dict[str, Any]]:
                     "new_para": False,
                 }
             )
-    return units
+    return units, formulas
 
 
 def _overlap_prefix(prev_text: str, overlap: int) -> str:
@@ -126,6 +158,8 @@ def _overlap_prefix(prev_text: str, overlap: int) -> str:
     """
     if overlap <= 0 or not prev_text:
         return ""
+    formulas: dict[str, str] = {}
+    prev_text = _protect_formulas(prev_text, formulas)
     sentences = split_sentences(prev_text)
     picked: list[str] = []
     total = 0
@@ -139,7 +173,78 @@ def _overlap_prefix(prev_text: str, overlap: int) -> str:
     prefix = "".join(picked).strip()
     if not prefix:
         prefix = prev_text[-overlap:].strip()
-    return prefix[:overlap].strip()
+    return _restore_formulas(prefix[:overlap].strip(), formulas)
+
+
+def _split_table_html(html: str, max_len: int) -> list[str]:
+    """表格太长时按行拆开，每块重复第一行表头。"""
+    if len(html) <= max_len:
+        return [html]
+    rows = re.findall(r"<tr\b[^>]*>.*?</tr>", html, re.S | re.I)
+    if len(rows) <= 1:
+        return [html]
+
+    header = rows[0]
+    body = rows[1:]
+    chunks: list[str] = []
+    current = [header]
+
+    for row in body:
+        candidate = "<table>" + "".join(current + [row]) + "</table>"
+        if len(candidate) > max_len and len(current) > 1:
+            chunks.append("<table>" + "".join(current) + "</table>")
+            current = [header, row]
+        else:
+            current.append(row)
+
+    if len(current) > 1 or not chunks:
+        chunks.append("<table>" + "".join(current) + "</table>")
+    return chunks
+
+
+def _html_table_text(html: str) -> str:
+    """把 HTML 表格压成纯文本，只给 BM25/向量索引用，不替换原文。"""
+    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+    text = re.sub(r"</t[dh]>", " | ", text, flags=re.I)
+    text = re.sub(r"</tr>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html_module.unescape(text)
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"\s+", " ", line).strip(" |")
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _table_chunks(para: dict[str, Any]) -> list[tuple[str, str]]:
+    """返回 (保留 HTML 的块文本, 给索引用的纯文本)。"""
+    caption = (para.get("caption") or "").strip()
+    html = (para.get("html") or "").strip()
+    if not html:
+        text = (para.get("text") or "").strip()
+        idx = text.find("<table")
+        if idx < 0:
+            return []
+        caption = caption or text[:idx].strip(" ：:")
+        html = text[idx:].strip()
+    if not html:
+        return []
+
+    prefix = f"{caption}\n\n" if caption else ""
+    body_limit = max(400, config.TABLE_CHUNK_MAX - len(prefix))
+    parts = _split_table_html(html, body_limit)
+
+    result: list[tuple[str, str]] = []
+    for i, part in enumerate(parts):
+        if i == 0:
+            cap = caption
+        else:
+            cap = f"{caption}（续表）" if caption else "（续表）"
+        text = f"{cap}\n\n{part}" if cap else part
+        index_text = f"{cap}\n{_html_table_text(part)}" if cap else _html_table_text(part)
+        result.append((text, index_text))
+    return result
 
 
 def chunk_parsed(parsed: dict[str, Any]) -> dict[str, Any]:
@@ -154,6 +259,7 @@ def chunk_parsed(parsed: dict[str, Any]) -> dict[str, Any]:
         chunk_type: str,
         page_start: int,
         page_end: int,
+        index_text: str | None = None,
     ) -> None:
         text = text.strip()
         if len(text) < 20:
@@ -161,6 +267,8 @@ def chunk_parsed(parsed: dict[str, Any]) -> dict[str, Any]:
         # 正文里偶尔会残留纯公式/表格碎片，中文字符太少就不建索引
         if chunk_type == "body" and len(re.findall(r"[一-鿿]", text)) < 8:
             return
+        if index_text is None:
+            index_text = text
         chunks.append(
             {
                 "chunk_id": "",
@@ -170,7 +278,7 @@ def chunk_parsed(parsed: dict[str, Any]) -> dict[str, Any]:
                 "page_start": page_start,
                 "page_end": page_end,
                 "text": text,
-                "index_text": f"《{title}》 > {' > '.join(section_path)} > {text}",
+                "index_text": f"《{title}》 > {' > '.join(section_path)} > {index_text}",
                 "char_count": len(text),
                 "prev_id": "",
                 "next_id": "",
@@ -179,51 +287,116 @@ def chunk_parsed(parsed: dict[str, Any]) -> dict[str, Any]:
 
     # 摘要单独成块；太长时按句子切开，避免一个块接近 1000 字
     if meta.get("abstract"):
-        for group in _primary_chunks(_text_units(meta["abstract"], 1)):
-            add_chunk(_join_units(group), ["摘要"], "abstract", 1, 1)
+        units, formulas = _text_units(meta["abstract"], 1)
+        for group in _primary_chunks(units):
+            add_chunk(
+                _restore_formulas(_join_units(group), formulas),
+                ["摘要"],
+                "abstract",
+                1,
+                1,
+            )
     if meta.get("keywords"):
         add_chunk("；".join(meta["keywords"]), ["关键词"], "keywords", 1, 1)
 
-    # 正文按章节切
+    # 正文按章节切；表格单独成块，公式跟前后正文放一起
     for section in parsed.get("sections", []):
         if section.get("type") != "body":
             continue
-        units = _units_for_section(section)
-        if not units:
-            continue
         section_path = section.get("section_path") or [section.get("title", "")]
-        primary = _primary_chunks(units)
-        section_chunks: list[dict[str, Any]] = []
-        for group in primary:
-            text = _join_units(group)
+
+        def flush_text(paragraphs: list[dict[str, Any]]) -> None:
+            units, formulas = _units_for_paragraphs(paragraphs, section)
+            if not units:
+                return
+            primary = _primary_chunks(units)
+            section_chunks: list[dict[str, Any]] = []
+            for group in primary:
+                text = _restore_formulas(_join_units(group), formulas)
+                if not text:
+                    continue
+                section_chunks.append(
+                    {
+                        "text": text,
+                        "page_start": min(u["page_start"] for u in group),
+                        "page_end": max(u["page_end"] for u in group),
+                    }
+                )
+
+            # 块间重叠（只在同一段连续正文内）
+            for i, item in enumerate(section_chunks):
+                if i > 0:
+                    # 先算这一块还剩多少空间，重叠不能把总长度顶过 600
+                    room = max(0, config.CHUNK_MAX - len(item["text"]))
+                    prefix = _overlap_prefix(
+                        section_chunks[i - 1]["text"],
+                        min(config.CHUNK_OVERLAP, room),
+                    )
+                    if prefix and not item["text"].startswith(prefix):
+                        item["text"] = prefix + item["text"]
+                add_chunk(
+                    item["text"],
+                    section_path,
+                    "body",
+                    item["page_start"],
+                    item["page_end"],
+                )
+
+        text_run: list[dict[str, Any]] = []
+        pending_equations: list[str] = []
+        for para in section.get("paragraphs", []):
+            kind = para.get("kind") or "text"
+            if kind == "table":
+                flush_text(text_run)
+                text_run = []
+                pending_equations = []
+                for table_text, table_index in _table_chunks(para):
+                    add_chunk(
+                        table_text,
+                        section_path,
+                        "table",
+                        para.get("page_start", section.get("page_start", 1)),
+                        para.get("page_end", section.get("page_end", 1)),
+                        index_text=table_index,
+                    )
+                continue
+
+            if kind == "equation":
+                latex = (para.get("latex") or para.get("text") or "").strip()
+                if not latex:
+                    continue
+                wrapped = f"$${latex}$$"
+                if text_run:
+                    prev = text_run[-1]
+                    prev["text"] = (prev.get("text") or "").rstrip() + "\n" + wrapped
+                    prev["page_end"] = max(
+                        prev.get("page_end", para.get("page_end", 1)),
+                        para.get("page_end", 1),
+                    )
+                else:
+                    pending_equations.append(wrapped)
+                continue
+
+            text = (para.get("text") or "").strip()
             if not text:
                 continue
-            section_chunks.append(
+            if pending_equations:
+                text = "\n".join(pending_equations) + "\n" + text
+                pending_equations = []
+            text_run.append(
                 {
                     "text": text,
-                    "page_start": min(u["page_start"] for u in group),
-                    "page_end": max(u["page_end"] for u in group),
+                    "page_start": para.get(
+                        "page_start", section.get("page_start", 1)
+                    ),
+                    "page_end": para.get(
+                        "page_end", section.get("page_end", 1)
+                    ),
                 }
             )
 
-        # 块间重叠（只在同一章节内）
-        for i, item in enumerate(section_chunks):
-            if i > 0:
-                # 先算这一块还剩多少空间，重叠不能把总长度顶过 600
-                room = max(0, config.CHUNK_MAX - len(item["text"]))
-                prefix = _overlap_prefix(
-                    section_chunks[i - 1]["text"],
-                    min(config.CHUNK_OVERLAP, room),
-                )
-                if prefix and not item["text"].startswith(prefix):
-                    item["text"] = prefix + item["text"]
-            add_chunk(
-                item["text"],
-                section_path,
-                "body",
-                item["page_start"],
-                item["page_end"],
-            )
+        flush_text(text_run)
+        # 只有公式、后面没有正文说明时，不生成纯公式块。
 
     # 编号 + 前后指针
     for i, chunk in enumerate(chunks, 1):

@@ -7,6 +7,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 DATA_DIR = ROOT / "data"
 PDF_DIR = DATA_DIR / "pdfs"
+# MinerU 输出的 middle JSON 放在这里；正式 build 只读这些 JSON。
+MINERU_JSON_DIR = DATA_DIR / "mineru_json"
 PARSED_DIR = DATA_DIR / "parsed"
 CHUNKS_DIR = DATA_DIR / "chunks"
 INDEX_DIR = DATA_DIR / "index"
@@ -27,6 +29,8 @@ CHUNK_TARGET = 450
 CHUNK_MAX = 600
 CHUNK_MIN = 200
 CHUNK_OVERLAP = 70
+# 表格带 HTML 标签，字符数比正文膨胀，单独给一个上限。
+TABLE_CHUNK_MAX = 1200
 
 # 检索参数
 BM25_K1 = 1.5

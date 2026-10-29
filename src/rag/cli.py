@@ -25,7 +25,8 @@ from .ingestion.downloader import (
     fetch_chinaxiv_catalog,
     merge_catalog_file,
 )
-from .ingestion.pdf_parser import inspect_page, parse_pdf
+from .ingestion.mineru_parser import parse_mineru_json
+from .ingestion.pdf_parser import inspect_page
 from .retrieval.search import load_chunks, search_chunks
 
 MODE_NAMES = {
@@ -61,12 +62,15 @@ def cmd_build(args: argparse.Namespace) -> int:
 
     if args.pdf:
         pdfs = [Path(args.pdf)]
+    elif args.ids:
+        pdfs = [config.PDF_DIR / f"{paper_id}.pdf" for paper_id in args.ids]
     else:
         pdfs = sorted(config.PDF_DIR.glob("*.pdf"))
     if not pdfs:
         print(f"没有找到 PDF。把 PDF 放进：{config.PDF_DIR}")
         return 1
 
+    mineru_dir = Path(args.mineru_dir)
     built = 0
     for n, pdf in enumerate(pdfs, 1):
         paper_id = pdf.stem
@@ -75,14 +79,29 @@ def cmd_build(args: argparse.Namespace) -> int:
         if not args.force and parsed_path.exists() and chunks_path.exists():
             print(f"[{n}/{len(pdfs)}] 跳过（已入库）：{pdf.name}  加 --force 可重做")
             continue
+        if not pdf.exists():
+            print(f"[{n}/{len(pdfs)}] 跳过：找不到 {pdf}")
+            continue
+        mineru_json = mineru_dir / f"{paper_id}.json"
+        if not mineru_json.exists():
+            print(
+                f"[{n}/{len(pdfs)}] 跳过：缺少 MinerU 解析结果 "
+                f"{mineru_json}。先用 mineru-kit parse --format middle_json 生成。"
+            )
+            continue
 
-        print(f"[{n}/{len(pdfs)}] 解析：{pdf.name}")
-        parsed = parse_pdf(
-            pdf,
-            paper_id=paper_id,
-            overrides=overrides_all.get(paper_id, {}),
-            out_path=parsed_path,
-        )
+        print(f"[{n}/{len(pdfs)}] 解析：{pdf.name}（MinerU JSON）")
+        try:
+            parsed = parse_mineru_json(
+                mineru_json,
+                paper_id=paper_id,
+                overrides=overrides_all.get(paper_id, {}),
+                out_path=parsed_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"    ⚠ MinerU 结果解析失败：{exc}")
+            parsed_path.unlink(missing_ok=True)
+            continue
         body_text = "".join(
             section.get("text", "")
             for section in parsed.get("sections", [])
@@ -105,7 +124,9 @@ def cmd_build(args: argparse.Namespace) -> int:
         print(f"    标题：{meta.get('title')}")
         print(
             f"    页数：{q['page_count']} | 正文字符：{q['body_chars']} | "
-            f"章节：{q['body_section_count']} | 参考文献：{'有' if q['reference_found'] else '无'}"
+            f"章节：{q['body_section_count']} | 表：{q.get('table_count', 0)} | "
+            f"公式：{q.get('equation_count', 0)} | "
+            f"参考文献：{'有' if q['reference_found'] else '无'}"
         )
         stats = result["stats"]
         print(
@@ -118,9 +139,11 @@ def cmd_build(args: argparse.Namespace) -> int:
         if removed:
             print(
                 "    清理："
-                f"页眉页脚 {removed.get('页眉页脚', 0)} 行 | "
-                f"脚注 {removed.get('脚注', 0)} 行 | "
-                f"公式/表格/图注 {removed.get('小字号(公式/表格/图注)', 0)} 行"
+                f"页眉页脚 {removed.get('页眉页脚', 0)} | "
+                f"脚注 {removed.get('脚注', 0)} | "
+                f"参考文献 {removed.get('参考文献', 0)} | "
+                f"图片 {removed.get('图片', 0)} | "
+                f"重复段落 {removed.get('重复段落', 0)}"
             )
         built += 1
 
@@ -979,8 +1002,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_build = sub.add_parser("build", help="解析 PDF、切片并入库")
+    p_build = sub.add_parser("build", help="读取 MinerU JSON、切片并入库")
     p_build.add_argument("--pdf", help="只处理某一份 PDF")
+    p_build.add_argument("--ids", nargs="*", help="只处理这些论文编号")
+    p_build.add_argument(
+        "--mineru-dir",
+        default=str(config.MINERU_JSON_DIR),
+        help="MinerU middle JSON 所在目录",
+    )
     p_build.add_argument("--force", action="store_true", help="已入库也重做")
     p_build.add_argument("--embed", action="store_true", help="入库后顺便建立向量索引")
     p_build.set_defaults(func=cmd_build)
