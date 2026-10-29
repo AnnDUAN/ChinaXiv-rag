@@ -637,6 +637,78 @@ def _line_texts(lines: Iterable[Line]) -> str:
     return "\n".join(clean_text(l.text) for l in lines)
 
 
+def _looks_like_title_continuation(text: str) -> bool:
+    """标题的副标题，常见写法是“——……”或“--……”。"""
+    return bool(re.match(r"^[—\-–－]{1,3}\s*\S", normalize_spaces(text)))
+
+
+_AUTHOR_STOP_WORDS = (
+    "摘要",
+    "关键词",
+    "中图分类号",
+    "文献标识码",
+    "文章编号",
+    "Abstract",
+    "Key words",
+    "DOI",
+    "收稿日期",
+    "基金项目",
+    "作者简介",
+    "通信作者",
+    "预印本",
+    "投稿前",
+    "同行评审",
+)
+
+
+def _clean_author_text(text: str) -> str:
+    text = normalize_spaces(text)
+    text = re.sub(r"^作者\s*[：:]\s*", "", text)
+    # 作者和单位写在同一行时，先把括号里的单位去掉。
+    text = re.sub(r"[（(][^）)]*[）)]", "", text)
+    return text.strip(" ,，、;；")
+
+
+def _author_score(text: str) -> int:
+    """给作者候选行打分，避免把副标题或单位行当成作者。"""
+    raw = normalize_spaces(text)
+    if not raw or len(raw) > 100:
+        return -999
+    if any(word in raw for word in _AUTHOR_STOP_WORDS):
+        return -999
+    if _looks_like_title_continuation(raw):
+        return -999
+    if re.search(r"^[\[【]", raw) or raw.endswith("。"):
+        return -999
+    if re.search(r"[：:]", raw) and not re.match(r"^作者\s*[：:]", raw):
+        return -999
+
+    cleaned = _clean_author_text(raw)
+    if not cleaned or not _is_cjk(cleaned):
+        return -999
+    if any(word in cleaned for word in ("大学", "学院", "研究所", "实验室")):
+        return -999
+
+    score = 0
+    # 只有 2～4 个汉字的一行，通常就是独立成一行的作者名
+    if re.fullmatch(r"[一-鿿]{2,4}", cleaned):
+        score += 5
+    # 常见作者行：2～4 个汉字的人名开头，后面跟空格、逗号或上标
+    if re.match(r"^[一-鿿]{2,4}(?=[\s，,、;；*†‡\d])", cleaned):
+        score += 3
+    if re.search(r"[（(]", raw):
+        score += 1
+    if re.search(r"\d", cleaned):
+        score += 1
+    if re.search(r"[,，、;；\s]", cleaned):
+        score += 1
+    if 2 <= len(cleaned) <= 50:
+        score += 1
+    if len(cleaned) > 60 and not re.search(r"[,，、;；\s]", cleaned):
+        score -= 2
+    return score
+
+
 def _extract_metadata(
     raw_first_page: list[Line],
     paper_id: str,
@@ -667,53 +739,107 @@ def _extract_metadata(
             title = join_lines(title, extra.text)
         meta["title"] = normalize_spaces(title)
         title_y = title_lines[-1].y1
+
+        # 副标题常比主标题小半号，不参与最大字号筛选，单独接上。
+        for line in lines:
+            if line.y0 <= title_y:
+                continue
+            if line.y0 - title_y > 24:
+                break
+            if (
+                _looks_like_title_continuation(line.text)
+                and line.size >= max_size - 4
+                and len(CJK.findall(line.text)) >= 4
+            ):
+                meta["title"] = normalize_spaces(
+                    join_lines(meta["title"], line.text)
+                )
+                title_y = line.y1
+                break
     else:
         meta["title"] = ""
         title_y = 0
 
-    # 作者：标题下方、字号 9～13、不是单位行
-    author_candidates = [
-        l
-        for l in lines
-        if l.y0 > title_y
-        and 9 <= l.size <= 13.5
-        and _is_cjk(l.text)
-        and "大学" not in l.text
-        and "学院" not in l.text
-        and not l.text.startswith(("（", "("))
-        and len(l.text) < 80
-    ]
-    if author_candidates:
-        author_text = normalize_spaces(author_candidates[0].text)
-        # 去掉名字后面的上标编号：纪馨玉1,2,3,4 -> 纪馨玉
-        author_text = re.sub(
-            r"(?<=[一-鿿])\d+(?:[,，]\d+)*[*†‡]*", "", author_text
-        )
-        author_text = re.sub(r"[*†‡​]+$", "", author_text).strip()
-        names = [
-            a.strip()
-            for a in re.split(r"[，,、\s]+", author_text)
-            if a.strip() and a.strip() not in {"等", "et al", "et al."}
-        ]
-        meta["authors"] = [
-            re.sub(r"(?<=[一-鿿])\s+(?=[一-鿿])", "", n).strip()
-            for n in names
-        ]
-        author_y = author_candidates[0].y1
-    else:
-        meta["authors"] = []
-        author_y = title_y
-
-    # 单位：只看作者下方、摘要之前，且明确含机构关键词。
-    # 有些 PDF 不以括号开头，而是“1. 中国科学院大学……”。
+    # 摘要开始的位置是作者区域的硬边界，避免把摘要正文当作者。
     abstract_y = next(
         (
             l.y0
             for l in front_lines
-            if re.match(r"^摘\s*要\s*[：:]?", normalize_spaces(l.text))
+            if re.match(
+                r"^(摘\s*要|Abstract)\s*[：:]?",
+                normalize_spaces(l.text),
+                re.I,
+            )
         ),
-        author_y + 80,
+        title_y + 200,
     )
+
+    # 作者：标题和摘要之间、字号 9～13，按“像人名”的程度挑最像的一行。
+    # 有些 PDF 会把同一行的几位作者拆到左右两栏，这里按纵向重叠合并。
+    author_candidates = [
+        l
+        for l in front_lines
+        if title_y < l.y0 < abstract_y
+        and 9 <= l.size <= 13.5
+        and _is_cjk(l.text)
+        and len(l.text) < 100
+    ]
+    author_bands: list[list[Line]] = []
+    for line in sorted(author_candidates, key=lambda l: (l.y0, l.x0)):
+        if author_bands:
+            last = author_bands[-1][-1]
+            overlap = min(last.y1, line.y1) - max(last.y0, line.y0)
+            min_height = min(last.height, line.height) or 1
+            if overlap > 0.5 * min_height:
+                author_bands[-1].append(line)
+                continue
+        author_bands.append([line])
+
+    scored: list[tuple[int, str, Line]] = []
+    for band in author_bands:
+        band.sort(key=lambda l: l.x0)
+        text = band[0].text
+        for nxt in band[1:]:
+            text = join_lines(text, nxt.text)
+        scored.append((_author_score(text), text, band[-1]))
+    scored.sort(key=lambda item: (-item[0], item[2].y0))
+
+    if scored and scored[0][0] >= 5:
+        _, author_text, author_last = scored[0]
+        author_text = _clean_author_text(author_text)
+        # 去掉名字后面的上标编号：纪馨玉1,2,3,4 -> 纪馨玉
+        author_text = re.sub(
+            r"(?<=[一-鿿])\s*\d+(?:[,，]\d+)*[*†‡]*", "", author_text
+        )
+        author_text = re.sub(r"[*†‡​]+$", "", author_text).strip(" ,，、;；")
+        raw_names = [
+            a.strip()
+            for a in re.split(r"[，,、;；\s]+", author_text)
+            if a.strip()
+            and a.strip() not in {"等", "et al", "et al."}
+            and len(a.strip()) <= 20
+        ]
+        names: list[str] = []
+        for name in raw_names:
+            if re.fullmatch(r"[\d\W_]+", name):
+                continue
+            # PDF 有时把“刘徽”拆成“刘 徽”两个单字，接回去
+            if (
+                re.fullmatch(r"[一-鿿]", name)
+                and names
+                and re.fullmatch(r"[一-鿿]", names[-1])
+            ):
+                names[-1] += name
+                continue
+            names.append(name)
+        meta["authors"] = [
+            re.sub(r"(?<=[一-鿿])\s+(?=[一-鿿])", "", n).strip()
+            for n in names
+        ]
+        author_y = author_last.y1
+    else:
+        meta["authors"] = []
+        author_y = title_y
     affiliation_parts: list[str] = []
     for l in front_lines:
         text = normalize_spaces(l.text)
