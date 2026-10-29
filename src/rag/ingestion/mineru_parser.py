@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+import jieba
+
 from .. import config
 from ..common.utils import file_sha256, normalize_spaces
 
@@ -43,17 +45,35 @@ AFFILIATION_WORDS = (
     "实验室",
     "研究中心",
     "学校",
+    "公司",
+    "科学院",
+    "医院",
+    "协会",
+    "学会",
+    "图书馆",
+    "出版社",
 )
 
 CLASSIFICATION_RE = re.compile(
-    r"^(中图分类号|分类号|文献标识码|文章编号|DOI|收稿日期|修回日期|"
-    r"基金项目|作者简介|通信作者|通信联系人|预印本说明)\s*[：:]",
+    r"^[\[【(（［]?\s*(中图分类号|分类号|文献标识码|文献标志码|文章编号|DOI|"
+    r"收稿日期|修回日期|基金项目|作者简介|通信作者|通信联系人|预印本说明)"
+    r"\s*[\]】)）］]?\s*[：:]?",
     re.I,
 )
 PREPRINT_RE = re.compile(r"^(预印本|preprint)", re.I)
-ABSTRACT_RE = re.compile(r"^摘\s*要\s*[：:]?$", re.I)
+ABSTRACT_RE = re.compile(r"^(?:摘\s*要|提\s*要)\s*[：:]?$", re.I)
+ABSTRACT_INLINE_RE = re.compile(
+    r"^[\[【(（［]\s*(?:摘\s*要|提\s*要)\s*[\]】)）］]\s*(.+)$",
+    re.S,
+)
+ABSTRACT_COLON_RE = re.compile(r"^(?:摘\s*要|提\s*要)\s*[：:]\s*(.+)$", re.S)
+ABSTRACT_PLAIN_RE = re.compile(r"^(?:摘\s*要|提\s*要)\s+(.+)$", re.S)
 ABSTRACT_EN_RE = re.compile(r"^abstract\s*[：:]?$", re.I)
-KEYWORDS_RE = re.compile(r"^(关键词|关键字|key\s*words?)\s*[：:]?\s*", re.I)
+KEYWORDS_RE = re.compile(
+    r"^[\[【(（［]?\s*(关键词|关键字|关\s*键\s*词|key\s*words?)\s*"
+    r"[\]】)）］]?\s*[：:]?\s*",
+    re.I,
+)
 REFERENCE_RE = re.compile(
     r"^[\[【]?\s*参\s*考\s*文\s*献\s*[\]】]?\s*(?:[（(]\s*references?\s*[）)])?\s*[：:]?$",
     re.I,
@@ -61,9 +81,14 @@ REFERENCE_RE = re.compile(
 REFERENCE_EN_RE = re.compile(r"^references?\s*[：:]?$", re.I)
 BODY_HEADING_RE = re.compile(r"^\d{1,2}(?:\.\d{1,2}){0,3}[.、]?\s+\S")
 LIST_HEADING_RE = re.compile(r"^[（(]\d{1,2}[）)]\s*\S")
+LIST_NUMBER_RE = re.compile(r"^\d{1,2}[.、]\s+\S")
 CAPTION_RE = re.compile(r"^(表|图)\s*\d+(?:[-.]\d+)*\s*\S")
 END_MATTER_RE = re.compile(
     r"^(作者贡献(声明)?|利益冲突(声明)?|数据可用性(声明)?)\s*[：:]?$"
+)
+ABS_TITLE_SKIP_RE = re.compile(
+    r"^(摘\s*要|提\s*要|关\s*键\s*词|关键词|关键字|abstract|key\s*words?|目录|引言)\b",
+    re.I,
 )
 
 
@@ -213,10 +238,23 @@ def _is_noise(text: str) -> bool:
 def _looks_like_person(text: str) -> bool:
     value = re.sub(r"^作者\s*[：:]\s*", "", text)
     value = re.sub(r"[（(].*$", "", value).strip()
-    value = re.sub(r"\d+", "", value).strip(" *†‡,，、;；")
+    value = re.sub(r"[\d¹²³⁴⁵⁶⁷⁸⁹⁰]+", "", value).strip(
+        " *†‡∗,，、;；"
+    )
     if re.fullmatch(r"[一-鿿]{2,4}", value):
         return True
     if re.fullmatch(r"[A-Za-z][A-Za-z .'\-]{1,59}", value):
+        return True
+    return False
+
+
+def _looks_like_name(text: str) -> bool:
+    if re.fullmatch(r"[一-鿿]{2,6}", text):
+        return True
+    if re.fullmatch(
+        r"[A-Za-z][A-Za-z.'\-]*(?:\s+[A-Za-z][A-Za-z.'\-]*){1,3}",
+        text,
+    ):
         return True
     return False
 
@@ -226,27 +264,57 @@ def _parse_author_names(text: str) -> list[str]:
     text = re.sub(r"^作者\s*[：:]\s*", "", text)
     text = re.sub(r"[（(][^）)]*[）)]", "", text)
     # “卢玉鑫 1,2”“张淏1”这类上标编号直接贴在人名后面
-    text = re.sub(r"(?<=[一-鿿])\s*\d+(?:[,，]\d+)*[*†‡]*", "", text)
-    text = re.sub(r"(?<=[A-Za-z])\d+(?:[,，]\d+)*[*†‡]*", "", text)
-    text = re.sub(r"[*†‡]+$", "", text).strip(" ,，、;；")
+    text = re.sub(
+        r"(?<=[一-鿿])\s*\d+[A-Za-z]?(?:[,，]\d+[A-Za-z]?)*[*†‡∗]*",
+        "",
+        text,
+    )
+    text = re.sub(r"(?<=[一-鿿])\s*[¹²³⁴⁵⁶⁷⁸⁹⁰]+", "", text)
+    text = re.sub(
+        r"(?<=[A-Za-z])\d+[A-Za-z]?(?:[,，]\d+[A-Za-z]?)*"
+        r"[*†‡∗¹²³⁴⁵⁶⁷⁸⁹⁰]*",
+        "",
+        text,
+    )
+    text = re.sub(r"[*†‡∗]+$", "", text).strip(" ,，、;；.)）]")
+
+    # 英文作者用逗号分隔，名和姓之间的空格不能当分隔符。
+    if re.search(r"[A-Za-z]", text) and not re.search(r"[一-鿿]", text):
+        text = re.sub(r"[*†‡∗]", "", text)
+        text = re.sub(r"\b\d+\b", "", text)
+        parts = [
+            normalize_spaces(item).strip(" ,，、;；.")
+            for item in re.split(r"[，,、;；]+", text)
+            if item.strip()
+        ]
+        return [item for item in parts if _looks_like_name(item)]
+
     raw = [
         item.strip()
         for item in re.split(r"[，,、;；\s]+", text)
         if item.strip()
     ]
+    # “张 三”被空格拆成两个单字时，先合回去。
+    merged_raw: list[str] = []
+    i = 0
+    while i < len(raw):
+        if (
+            re.fullmatch(r"[一-鿿]", raw[i])
+            and i + 1 < len(raw)
+            and re.fullmatch(r"[一-鿿]", raw[i + 1])
+        ):
+            merged_raw.append(raw[i] + raw[i + 1])
+            i += 2
+        else:
+            merged_raw.append(raw[i])
+            i += 1
+
     names: list[str] = []
-    for item in raw:
+    for item in merged_raw:
+        item = item.strip(" *†‡∗,，.;；")
         if re.fullmatch(r"[\d\W_]+", item):
             continue
-        if len(item) > 20:
-            continue
-        if (
-            re.fullmatch(r"[一-鿿]", item)
-            and names
-            and re.fullmatch(r"[一-鿿]", names[-1])
-        ):
-            names[-1] += item
-        else:
+        if _looks_like_name(item):
             names.append(item)
     return names
 
@@ -260,7 +328,22 @@ def _clean_affiliation(text: str) -> str:
     # 同一行里可能有多个并列单位：“（A）（B）” -> “A；B”
     text = text.replace("）（", "；").replace(")（", "；")
     text = text.replace("）(", "；").replace(")(", "；")
+    text = re.sub(r"[）)]\s*\d{1,2}\s*[（(]", "；", text)
     text = re.sub(r"^[（(]|[）)]$", "", text)
+    # “（1. A大学；2. B学院）”去掉外层括号后，还要再清一次编号。
+    text = re.sub(r"^[\d¹²³⁴⁵⁶⁷⁸⁹⁰]+\s*[.、]?\s*", "", text)
+    text = re.sub(r"([；;])\s*\d{1,2}\s*[.、]\s*", r"\1", text)
+    # 同一行里的第二个单位：“…… 北京 100101 2 中国科学院大学……”
+    text = re.sub(r"\s+\d{1,2}\s+(?=[一-鿿]{2,})", "；", text)
+    # “a.航海学院”这种学院编号
+    text = re.sub(r"(?<![A-Za-z])[a-z]\.(?=[一-鿿])", "", text)
+    # 单位后面经常跟着邮箱/电话，检索时不需要。
+    text = re.split(
+        r"(?:E-?mail|邮箱|联系电话|电话|ORCID)\s*[：:]?",
+        text,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
     return normalize_spaces(text).strip("；;，, ")
 
 
@@ -275,14 +358,33 @@ def _find_index(
     return None
 
 
+def _abstract_heading_parts(block: Block) -> tuple[bool, str]:
+    """返回 (是否摘要标题, 标题块里自带的摘要正文)。"""
+    if block.type not in HEADING_TYPES | TEXT_TYPES:
+        return False, ""
+    text = block.text.strip()
+    if ABSTRACT_RE.match(text) or ABSTRACT_EN_RE.match(text):
+        return True, ""
+    match = ABSTRACT_INLINE_RE.match(text)
+    if match:
+        return True, match.group(1).strip()
+    match = ABSTRACT_COLON_RE.match(text)
+    if match:
+        return True, match.group(1).strip()
+    match = ABSTRACT_PLAIN_RE.match(text)
+    if match:
+        return True, match.group(1).strip()
+    return False, ""
+
+
 def _is_abstract_heading(block: Block) -> bool:
-    return block.type in HEADING_TYPES | TEXT_TYPES and bool(
-        ABSTRACT_RE.match(block.text) or ABSTRACT_EN_RE.match(block.text)
-    )
+    return _abstract_heading_parts(block)[0]
 
 
 def _is_keywords_line(block: Block) -> bool:
-    return block.type in TEXT_TYPES and bool(KEYWORDS_RE.match(block.text))
+    return block.type in TEXT_TYPES | HEADING_TYPES and bool(
+        KEYWORDS_RE.match(block.text)
+    )
 
 
 def _is_body_heading(block: Block) -> bool:
@@ -319,25 +421,38 @@ def _front_matter(blocks: list[Block]) -> dict[str, Any]:
             title_idx = i
             break
 
-    # 如果 MinerU 没有标出 doc_title，退而取摘要之前第一段不太像作者/单位的文字。
+    # 如果 MinerU 没有标出 doc_title，优先取摘要之前第一个像标题的段落。
     if not title and abstract_idx is not None:
-        for i in range(abstract_idx):
-            block = blocks[i]
-            if block.type not in TEXT_TYPES:
-                continue
-            if _is_noise(block.text):
-                continue
-            if any(word in block.text for word in AFFILIATION_WORDS):
-                continue
-            if _looks_like_person(block.text):
-                continue
-            title = block.text
-            title_idx = i
-            break
+        candidates = [
+            (i, b)
+            for i, b in enumerate(blocks[:abstract_idx])
+            if b.type in TEXT_TYPES | HEADING_TYPES
+            and not _is_noise(b.text)
+            and not any(word in b.text for word in AFFILIATION_WORDS)
+            and not _looks_like_person(b.text)
+            and not ABS_TITLE_SKIP_RE.match(b.text)
+        ]
+        candidates.sort(key=lambda item: (item[1].type != "paragraph_title", item[0]))
+        if candidates:
+            title_idx, title_block = candidates[0]
+            title = title_block.text
 
+    title, inline_authors = _split_title_authors(title)
     authors: list[str] = []
     affiliations: list[str] = []
-    author_end = abstract_idx if abstract_idx is not None else len(blocks)
+    for name in _parse_author_names(inline_authors):
+        if name not in authors:
+            authors.append(name)
+    if abstract_idx is not None:
+        author_end = abstract_idx
+    else:
+        # 没有识别到摘要时，只在前置区域找作者，避免把正文整段吞进来。
+        start = (title_idx + 1) if title_idx is not None else 0
+        author_end = min(len(blocks), start + 20)
+        for i in range(start, author_end):
+            if blocks[i].type in HEADING_TYPES:
+                author_end = i
+                break
 
     for block in blocks[(title_idx + 1 if title_idx is not None else 0):author_end]:
         if block.type in NOISE_TYPES or block.type in IMAGE_TYPES:
@@ -349,22 +464,75 @@ def _front_matter(blocks: list[Block]) -> dict[str, Any]:
             continue
 
         has_affiliation = any(word in text for word in AFFILIATION_WORDS)
-        if has_affiliation and not _looks_like_person(text):
+        # 作者已经找到后，后面的“1 南京师范大学……”一般就是单位行，
+        # 不要再从里面拆出“南京”这种假作者。
+        if has_affiliation and authors:
             cleaned = _clean_affiliation(text)
             if cleaned and cleaned not in affiliations:
                 affiliations.append(cleaned)
             continue
 
-        for name in _parse_author_names(text):
+        prefix = re.split(r"[（(]", text, 1)[0]
+        prefix = re.sub(r"^作者\s*[：:]\s*", "", prefix).strip()
+        names = _parse_author_names(prefix)
+
+        # “李宇轩重庆邮电大学……”这种名字和单位粘在一起、又没有括号。
+        # 用 jieba 先把开头的人名切出来，比按固定长度硬猜稳。
+        if has_affiliation and not re.search(r"[（(]", text):
+            tokens = [t for t in jieba.lcut(prefix) if t.strip()]
+            next_is_affiliation = (
+                len(tokens) > 1
+                and any(word in tokens[1] for word in AFFILIATION_WORDS)
+            )
+            if (
+                tokens
+                and not next_is_affiliation
+                and re.fullmatch(r"[一-鿿]{2,3}", tokens[0])
+            ):
+                name = tokens[0]
+                if (
+                    len(name) == 2
+                    and len(tokens) > 1
+                    and re.fullmatch(r"[一-鿿]", tokens[1])
+                ):
+                    name += tokens[1]
+                names = [name]
+
+        if not names:
+            if has_affiliation:
+                cleaned = _clean_affiliation(text)
+                if cleaned and cleaned not in affiliations:
+                    affiliations.append(cleaned)
+            continue
+
+        for name in names:
             if name not in authors:
                 authors.append(name)
 
-        if has_affiliation and _looks_like_person(text):
-            for inside in re.findall(r"[（(]([^）)]+)[）)]", text):
+        if has_affiliation:
+            inside_parts = re.findall(r"[（(]([^）)]+)[）)]", text)
+            for inside in inside_parts:
                 if any(word in inside for word in AFFILIATION_WORDS):
                     cleaned = _clean_affiliation(inside)
                     if cleaned and cleaned not in affiliations:
                         affiliations.append(cleaned)
+            if not inside_parts and prefix.startswith(names[0]):
+                rest = prefix[len(names[0]):]
+                cleaned = _clean_affiliation(rest)
+                if cleaned and cleaned not in affiliations:
+                    affiliations.append(cleaned)
+
+    # 有些期刊把作者信息放在首页脚注的“第一作者/通信作者”里。
+    if not authors:
+        for block in blocks[: min(len(blocks), 30)]:
+            for match in re.finditer(
+                r"(?:第一作者|通信作者|作者简介|作者)\s*[：:]?\s*"
+                r"([一-鿿]{2,4})(?=[（(，,。；;]|$)",
+                block.text,
+            ):
+                name = match.group(1)
+                if name not in authors:
+                    authors.append(name)
 
     abstract = ""
     keywords: list[str] = []
@@ -384,6 +552,9 @@ def _front_matter(blocks: list[Block]) -> dict[str, Any]:
                 abstract_stop = i
                 break
         abstract_lines = []
+        _, inline_abstract = _abstract_heading_parts(blocks[abstract_idx])
+        if inline_abstract:
+            abstract_lines.append(inline_abstract)
         for block in blocks[abstract_start:abstract_stop]:
             if block.type not in TEXT_TYPES:
                 continue
@@ -392,13 +563,34 @@ def _front_matter(blocks: list[Block]) -> dict[str, Any]:
             abstract_lines.append(block.text)
         abstract = "\n".join(abstract_lines).strip()
 
-    if keywords_idx is not None:
-        rest = KEYWORDS_RE.sub("", blocks[keywords_idx].text, count=1)
-        keywords = [
-            item.strip()
-            for item in re.split(r"[；;，,、]+", rest)
-            if item.strip()
-        ]
+    if abstract_idx is not None:
+        body_candidate = _find_index(blocks, abstract_idx + 1, _is_body_heading)
+        keyword_stop = body_candidate if body_candidate is not None else len(blocks)
+        # 有些论文先放英文 Abstract，再放中文关键词，所以单独再找一遍。
+        if keywords_idx is None:
+            for i in range(abstract_idx + 1, keyword_stop):
+                if _is_keywords_line(blocks[i]):
+                    keywords_idx = i
+                    break
+        if keywords_idx is not None and keywords_idx < keyword_stop:
+            rest = KEYWORDS_RE.sub("", blocks[keywords_idx].text, count=1).strip()
+            if not rest:
+                for block in blocks[keywords_idx + 1:keyword_stop]:
+                    if block.type in TEXT_TYPES and not _is_noise(block.text):
+                        rest = block.text.strip()
+                        break
+            keywords = [
+                item.strip()
+                for item in re.split(r"[；;，,、]+", rest)
+                if item.strip()
+            ]
+            # “可重构芯片 演进历程 新型构架芯片”这种用空格分隔的
+            if len(keywords) == 1 and " " in keywords[0]:
+                spaced = [item for item in keywords[0].split() if item]
+                if len(spaced) > 1 and all(len(item) <= 10 for item in spaced):
+                    keywords = spaced
+        else:
+            keywords_idx = None
 
     return {
         "title": title,
@@ -437,7 +629,13 @@ def _reference_start(blocks: list[Block], body_start: int) -> int | None:
         return idx
     for i in range(body_start, len(blocks)):
         block = blocks[i]
-        if block.type == "ref_text" and re.match(r"^[\[［]\d{1,3}[\]］]", block.text):
+        if block.type != "ref_text":
+            continue
+        if re.match(r"^[\[［]\d{1,3}[\]］]", block.text):
+            return i
+        # 英文期刊常用 APA 格式，没有 [1]，但会连续出现很多 ref_text。
+        window = blocks[i:i + 20]
+        if sum(1 for item in window if item.type == "ref_text") >= 3:
             return i
     return None
 
@@ -473,6 +671,35 @@ def _normalize_caption(text: str) -> str:
         text,
     )
     return text
+
+
+def _split_title_authors(text: str) -> tuple[str, str]:
+    """有些论文把标题和作者粘在同一个 doc_title 块里。"""
+    tokens = list(jieba.cut(text))
+    position = 0
+    for index, token in enumerate(tokens):
+        start = position
+        position += len(token)
+        if not re.search(r"[\d¹²³⁴⁵⁶⁷⁸⁹⁰]", token):
+            continue
+        # 第一个数字前面的那个 2～3 字中文词，通常就是第一作者。
+        previous = index - 1
+        while previous >= 0 and not re.fullmatch(
+            r"[一-鿿]{2,3}", tokens[previous]
+        ):
+            previous -= 1
+        if previous < 0:
+            continue
+        name_start = sum(len(item) for item in tokens[:previous])
+        rest = text[name_start:]
+        groups = re.findall(
+            r"[一-鿿]{2,4}\s*[\d¹²³⁴⁵⁶⁷⁸⁹⁰]+",
+            rest,
+        )
+        if len(groups) >= 2 and name_start >= 4:
+            return text[:name_start].strip(), rest.strip()
+        break
+    return text, ""
 
 
 def _caption_from_equation(latex: str) -> str:
@@ -586,6 +813,11 @@ def _build_sections(
             if CAPTION_RE.match(text):
                 pending_caption = _normalize_caption(text)
                 pending_text_caption = None
+                continue
+            # 二级标题下面又出现“1. ……”时，通常是正文里的编号列表，
+            # 不是新章节；把它当正文，避免切出一堆很小的章节。
+            if stack and stack[-1][0] >= 2 and LIST_NUMBER_RE.match(text):
+                append_text(block, text)
                 continue
             pending_caption = ""
             level = _heading_level(block, stack)
