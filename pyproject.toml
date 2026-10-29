@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agentic-rag"
 version = "0.1.0"
-description = "Local paper RAG with PostgreSQL/pgvector, hybrid retrieval, rerank, structured Q&A and long-term memory"
+description = "Local paper RAG with PostgreSQL/pgvector, hybrid retrieval, rerank and structured Q&A"
 requires-python = ">=3.10"
 dependencies = [
   "pymupdf>=1.24",

@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS embeddings (
 CREATE INDEX IF NOT EXISTS embeddings_vector_idx
     ON embeddings USING hnsw (vector vector_cosine_ops);
 
--- 每次问答的记录，方便以后做评测、回溯和记忆模块。
+-- 每次问答的记录，方便以后做评测和回溯。
 CREATE TABLE IF NOT EXISTS queries (
     query_id          bigserial PRIMARY KEY,
     question          text NOT NULL,
@@ -106,52 +106,6 @@ CREATE TABLE IF NOT EXISTS query_results (
 
 CREATE INDEX IF NOT EXISTS queries_created_idx
     ON queries (created_at DESC);
-
--- 长期记忆
-CREATE TABLE IF NOT EXISTS memories (
-    id              bigserial PRIMARY KEY,
-    namespace       text NOT NULL DEFAULT 'default',
-    subject         text NOT NULL DEFAULT 'user:self',
-    kind            text NOT NULL,
-    content         text NOT NULL,
-    structured      jsonb NOT NULL DEFAULT '{}'::jsonb,
-    importance      smallint NOT NULL DEFAULT 5
-                    CHECK (importance BETWEEN 1 AND 10),
-    confidence      real NOT NULL DEFAULT 0.5
-                    CHECK (confidence BETWEEN 0 AND 1),
-    status          text NOT NULL DEFAULT 'active',
-    is_speculation  boolean NOT NULL DEFAULT false,
-    fingerprint     text NOT NULL,
-    source          text,
-    session_id      text,
-    t_valid_from    date NOT NULL DEFAULT CURRENT_DATE,
-    t_valid_to      date,
-    created_at      timestamptz NOT NULL DEFAULT now(),
-    updated_at      timestamptz NOT NULL DEFAULT now(),
-    last_used_at    timestamptz,
-    use_count       integer NOT NULL DEFAULT 0,
-    superseded_by   bigint REFERENCES memories(id) ON DELETE SET NULL,
-    embedding       vector(512),
-    UNIQUE (namespace, fingerprint)
-);
-
-CREATE INDEX IF NOT EXISTS memories_namespace_status_idx
-    ON memories (namespace, status);
-CREATE INDEX IF NOT EXISTS memories_subject_idx
-    ON memories (namespace, subject);
-CREATE INDEX IF NOT EXISTS memories_vector_idx
-    ON memories USING hnsw (embedding vector_cosine_ops);
-
-CREATE TABLE IF NOT EXISTS memory_events (
-    id          bigserial PRIMARY KEY,
-    memory_id   bigint,
-    action      text NOT NULL,
-    detail      jsonb NOT NULL DEFAULT '{}'::jsonb,
-    created_at  timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS memory_events_memory_idx
-    ON memory_events (memory_id, created_at DESC);
 
 -- Agent 多步运行的 checkpoint。
 -- state 保存完整进度，steps 保存每一步的摘要，便于断点续跑和排查。

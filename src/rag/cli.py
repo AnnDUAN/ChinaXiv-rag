@@ -338,27 +338,8 @@ def _print_answer_payload(payload: dict) -> None:
             print(f"  ⚠ {issue}")
 
 
-def _ask_memory_text(args: argparse.Namespace) -> str | None:
-    if not getattr(args, "memory", False):
-        return None
-    try:
-        from .memory.service import MemoryService
-
-        service = MemoryService(
-            namespace=args.memory_namespace,
-            subject=args.memory_subject,
-        )
-        return service.format_for_prompt(
-            args.query, top_k=args.memory_k
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"提示：长期记忆读取失败，本次不使用记忆（{exc}）。")
-        return None
-
-
 def cmd_ask(args: argparse.Namespace) -> int:
     """检索原文，再让大模型基于原文回答并标出处。"""
-    memory_text = _ask_memory_text(args)
     if args.prompt_only:
         try:
             prepared = prepare_answer(
@@ -367,7 +348,6 @@ def cmd_ask(args: argparse.Namespace) -> int:
                 mode=args.mode,
                 rerank=args.rerank,
                 structured=not args.plain,
-                memory_text=memory_text,
             )
         except Exception as exc:
             print(f"准备提示词失败：{exc}")
@@ -392,7 +372,6 @@ def cmd_ask(args: argparse.Namespace) -> int:
             mode=args.mode,
             rerank=args.rerank,
             structured=not args.plain,
-            memory_text=memory_text,
         )
     except Exception as exc:
         print(f"生成失败：{exc}")
@@ -482,7 +461,6 @@ def cmd_stats(args: argparse.Namespace) -> int:
         print(
             f"数据库：{db['papers']} 篇 | {db['chunks']} 个切片 | "
             f"{db['embeddings']} 个向量 | {db['queries']} 条问答记录 | "
-            f"{db.get('memories', 0)} 条记忆 | "
             f"{db.get('agent_runs', 0)} 次 Agent 运行"
         )
     except Exception:
@@ -522,7 +500,7 @@ def cmd_db(args: argparse.Namespace) -> int:
             print(
                 f"论文：{result['papers']} | 章节：{result['sections']} | "
                 f"切片：{result['chunks']} | 向量：{result['embeddings']} | "
-                f"问答记录：{result['queries']} | 记忆：{result.get('memories', 0)} | "
+                f"问答记录：{result['queries']} | "
                 f"Agent 运行：{result.get('agent_runs', 0)}"
             )
             return 0
@@ -531,116 +509,6 @@ def cmd_db(args: argparse.Namespace) -> int:
         return 1
 
     print("未知的数据库命令。")
-    return 1
-
-
-def cmd_memory(args: argparse.Namespace) -> int:
-    """长期记忆的命令行入口。"""
-    try:
-        from .memory.models import MemoryKind, MemoryStatus
-        from .memory.recall import format_memories
-        from .memory.service import MemoryService
-    except Exception as exc:  # noqa: BLE001
-        print(f"记忆模块不可用：{exc}")
-        return 1
-
-    service = MemoryService(
-        namespace=args.namespace,
-        subject=args.subject,
-    )
-    try:
-        if args.memory_command == "add":
-            kind = MemoryKind(args.kind)
-            result = service.add(
-                args.content,
-                kind=kind,
-                importance=args.importance,
-                confidence=args.confidence,
-                source=args.source,
-                session_id=args.session_id,
-                is_speculation=args.speculation,
-            )
-            print(f"结果：{result['action']} | id={result['memory_id']}")
-            print(f"原因：{result['reason']}")
-            return 0
-
-        if args.memory_command == "extract":
-            text = args.text
-            if args.file:
-                text = Path(args.file).read_text(encoding="utf-8")
-            results = service.extract(
-                text,
-                source=args.source,
-                session_id=args.session_id,
-                dry_run=args.dry_run,
-            )
-            if not results:
-                print("没有抽取到候选记忆。")
-                return 0
-            for result in results:
-                print(
-                    f"- {result['kind']} | {result['content']} | "
-                    f"重要度 {result['importance']} | "
-                    f"{result.get('decision', result.get('action', ''))}"
-                )
-            return 0
-
-        if args.memory_command == "list":
-            kind = MemoryKind(args.kind) if args.kind else None
-            status = None if args.all else MemoryStatus.ACTIVE
-            items = service.list(limit=args.k, status=status, kind=kind)
-            if not items:
-                print("没有记忆。")
-                return 0
-            for item in items:
-                print(
-                    f"[{item.id}] {item.kind.value} | {item.content} | "
-                    f"重要度 {item.importance} | 置信度 {item.confidence:.2f} | "
-                    f"{item.status.value}"
-                )
-            return 0
-
-        if args.memory_command == "search":
-            recalled = service.recall(
-                args.query,
-                top_k=args.k,
-                budget_chars=args.budget,
-            )
-            if not recalled:
-                print("没有召回记忆。")
-                return 0
-            print(format_memories(recalled, show_score=True))
-            return 0
-
-        if args.memory_command == "forget":
-            if service.forget(args.memory_id):
-                print(f"已归档记忆 {args.memory_id}。")
-                return 0
-            print(f"没有找到可归档的记忆 {args.memory_id}。")
-            return 1
-
-        if args.memory_command == "stats":
-            stats = service.stats()
-            print(
-                f"记忆：{stats.get('total', 0)} 条 | "
-                f"生效 {stats.get('active', 0)} | "
-                f"被取代 {stats.get('superseded', 0)} | "
-                f"已归档 {stats.get('archived', 0)}"
-            )
-            return 0
-
-        if args.memory_command == "events":
-            for event in service.events(limit=args.k):
-                print(
-                    f"{event['created_at']} | {event['action']} | "
-                    f"memory={event['memory_id']} | {event['detail']}"
-                )
-            return 0
-    except Exception as exc:  # noqa: BLE001
-        print(f"记忆操作失败：{exc}")
-        return 1
-
-    print("未知的记忆命令。")
     return 1
 
 
@@ -1167,14 +1035,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="不使用结构化输出，直接让模型返回普通文本",
     )
     p_ask.add_argument(
-        "--memory",
-        action="store_true",
-        help="把长期记忆一起放进问答上下文",
-    )
-    p_ask.add_argument("--memory-namespace", default="default")
-    p_ask.add_argument("--memory-subject", default="user:self")
-    p_ask.add_argument("--memory-k", type=int, default=5)
-    p_ask.add_argument(
         "--prompt-only",
         action="store_true",
         help="只显示检索上下文和提示词，不调用大模型",
@@ -1205,78 +1065,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_db_import.set_defaults(func=cmd_db)
     p_db_stats = db_sub.add_parser("stats", help="查看数据库统计")
     p_db_stats.set_defaults(func=cmd_db)
-
-    p_memory = sub.add_parser("memory", help="长期记忆管理")
-    mem_sub = p_memory.add_subparsers(
-        dest="memory_command", required=True
-    )
-
-    mem_add = mem_sub.add_parser("add", help="手动写入一条记忆")
-    mem_add.add_argument("content", help="记忆内容")
-    mem_add.add_argument(
-        "--kind",
-        choices=["fact", "preference", "event", "task", "correction"],
-        default="fact",
-    )
-    mem_add.add_argument("--importance", type=int, default=5)
-    mem_add.add_argument("--confidence", type=float, default=0.7)
-    mem_add.add_argument("--source", default="manual")
-    mem_add.add_argument("--session-id")
-    mem_add.add_argument("--speculation", action="store_true")
-    mem_add.add_argument("--namespace", default="default")
-    mem_add.add_argument("--subject", default="user:self")
-    mem_add.set_defaults(func=cmd_memory)
-
-    mem_extract = mem_sub.add_parser(
-        "extract", help="从对话文本抽取并写入记忆"
-    )
-    source_group = mem_extract.add_mutually_exclusive_group(required=True)
-    source_group.add_argument("--text", help="对话文本")
-    source_group.add_argument("--file", help="对话文本文件")
-    mem_extract.add_argument("--source", default="conversation")
-    mem_extract.add_argument("--session-id")
-    mem_extract.add_argument("--dry-run", action="store_true")
-    mem_extract.add_argument("--namespace", default="default")
-    mem_extract.add_argument("--subject", default="user:self")
-    mem_extract.set_defaults(func=cmd_memory)
-
-    mem_list = mem_sub.add_parser("list", help="列出记忆")
-    mem_list.add_argument("-k", type=int, default=20)
-    mem_list.add_argument(
-        "--kind",
-        choices=["fact", "preference", "event", "task", "correction"],
-    )
-    mem_list.add_argument(
-        "--all", action="store_true", help="包含非 active 状态"
-    )
-    mem_list.add_argument("--namespace", default="default")
-    mem_list.add_argument("--subject", default="user:self")
-    mem_list.set_defaults(func=cmd_memory)
-
-    mem_search = mem_sub.add_parser("search", help="按语义召回记忆")
-    mem_search.add_argument("query")
-    mem_search.add_argument("-k", type=int, default=5)
-    mem_search.add_argument("--budget", type=int, default=800)
-    mem_search.add_argument("--namespace", default="default")
-    mem_search.add_argument("--subject", default="user:self")
-    mem_search.set_defaults(func=cmd_memory)
-
-    mem_forget = mem_sub.add_parser("forget", help="归档一条记忆")
-    mem_forget.add_argument("memory_id", type=int)
-    mem_forget.add_argument("--namespace", default="default")
-    mem_forget.add_argument("--subject", default="user:self")
-    mem_forget.set_defaults(func=cmd_memory)
-
-    mem_stats = mem_sub.add_parser("stats", help="查看记忆统计")
-    mem_stats.add_argument("--namespace", default="default")
-    mem_stats.add_argument("--subject", default="user:self")
-    mem_stats.set_defaults(func=cmd_memory)
-
-    mem_events = mem_sub.add_parser("events", help="查看最近记忆事件")
-    mem_events.add_argument("-k", type=int, default=20)
-    mem_events.add_argument("--namespace", default="default")
-    mem_events.add_argument("--subject", default="user:self")
-    mem_events.set_defaults(func=cmd_memory)
 
     p_agent = sub.add_parser(
         "agent", help="多步检索 Agent：证据不够时补查，并保存运行进度"

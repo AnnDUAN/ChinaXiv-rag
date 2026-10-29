@@ -254,7 +254,6 @@ def stats(conn: psycopg.Connection | None = None) -> dict[str, int]:
             (SELECT count(*) FROM chunks) AS chunks,
             (SELECT count(*) FROM embeddings) AS embeddings,
             (SELECT count(*) FROM queries) AS queries,
-            (SELECT count(*) FROM memories) AS memories,
             (SELECT count(*) FROM agent_runs) AS agent_runs
         """
     ).fetchone()

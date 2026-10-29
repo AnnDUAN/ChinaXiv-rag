@@ -343,7 +343,6 @@ $env:RAG_DATABASE_URL = "postgresql://用户名:密码@主机:端口/数据库�
 - `chunks`：切片正文、页码、前后块、jieba 词；
 - `embeddings`：512 维 pgvector 向量；
 - `queries` / `query_results`：每次问答和它的检索结果，方便回溯和评测；
-- `memories` / `memory_events`：长期记忆、状态和审计事件；
 - `agent_runs` / `agent_steps`：Agent 多步运行的状态、最终答案和每一步记录。
 
 几个行为约定：
@@ -357,49 +356,6 @@ $env:RAG_DATABASE_URL = "postgresql://用户名:密码@主机:端口/数据库�
 - PostgreSQL 没有真正的 BM25；当前 BM25 仍然是 Python 自己实现的，数据库里只保存 jieba 分词结果。以后需要把打分也放进 SQL，可以再加；
 - 数据库只是数据源，BM25 和向量索引仍然可以单独重建；
 - 扩库后重新跑过现有三套测试集，结果见上面的“当前评测”。
-
-## 长期记忆
-
-记忆模块的详细设计见 `记忆模块设计.md`。
-
-最小可用流程：
-
-```powershell
-# 手动写入一条偏好
-.\rag memory add "用户偏好简洁的中文回答" --kind preference --importance 8 --confidence 0.9
-
-# 从一段对话中抽取（需要配置大模型）
-.\rag memory extract --text "用户：我以后都希望用中文回答。"
-
-# 按语义搜索记忆
-.\rag memory search "回答风格" -k 5
-
-# 查看记忆
-.\rag memory list -k 20
-
-# 归档一条记忆
-.\rag memory forget 1
-
-# 查看统计
-.\rag memory stats
-```
-
-问答时把记忆带进上下文：
-
-```powershell
-.\rag ask "我之前说过喜欢什么回答风格？" --memory
-```
-
-当前规则：
-
-- 完全相同内容不会重复写入；
-- 余弦相似度 ≥ 0.93 视为重复；
-- 同类别且相似度 ≥ 0.82 视为更新，旧记忆变成 `superseded`；
-- 重要度低于 5 的候选默认不写入；
-- 推测内容的置信度最高按 0.6 处理；
-- 召回时综合相关性、重要度、时间新鲜度和置信度，并限制字符预算。
-
-这是一个简化版：冲突处理主要依赖相似度，没有做参考项目里那么复杂的证据结算和多轮确认。
 
 ## 带出处的结构化问答（可选）
 
@@ -593,7 +549,6 @@ Agent 每次运行都会写两张表：
 agentic_rag/
   docker-compose.yml        PostgreSQL + pgvector 容器
   第一阶段结束文档.md        RAG v1 设计与评测总结
-  记忆模块设计.md            长期记忆设计
   Agent编排与Checkpoint设计.md  Agent 多步流程和断点续跑设计
   rag.cmd / rag.sh          命令行包装
   config/papers.json        论文补充信息
@@ -627,13 +582,6 @@ agentic_rag/
       structured.py         JSON Schema → JSON → 文本，逐级降级
       config.py             读取 config/llm.json
       mock.py               离线测试用假客户端
-    memory/                 长期记忆
-      models.py             记忆数据结构、指纹
-      extract.py            从对话抽取候选
-      gate.py               去重、更新、重要度过滤
-      store.py              PostgreSQL + pgvector 存储
-      recall.py             召回、打分、预算打包
-      service.py            对外统一入口
     generation/             生成
       answer.py             检索与生成分离、带出处的结构化问答
       schemas.py            结构化回答的字段定义
@@ -648,7 +596,6 @@ agentic_rag/
   tests/questions_40_hard.json 43 篇时期的 21 个口语化问题
   tests/questions_new60.json   新增语料的 20 个覆盖检查问题
   tests/test_llm_structured.py  结构化输出和引用校验的离线测试
-  tests/test_memory.py          记忆抽取、去重、更新和打包的离线测试
   tests/test_agent.py           Agent 流程、补查、停止和断点续跑的离线测试
 ```
 
@@ -660,5 +607,4 @@ agentic_rag/
 2. 用真实模型跑一小批 Agent 复杂问题，和普通 `rag ask` 对比答案质量、步数和耗时；
 3. 抽查新增论文的解析质量，尤其是警告多的几篇；
 4. 根据评测结果调整 Agent 的最大检索轮数和补查策略；
-5. 长期记忆已经完成，放在 `src/rag/memory/`，需要时再接入 Agent 或问答流程；
-6. 做一个简单的网页界面。
+5. 做一个简单的网页界面。

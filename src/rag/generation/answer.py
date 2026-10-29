@@ -68,9 +68,8 @@ def build_messages(
     query: str,
     results: list[dict[str, Any]],
     structured: bool = False,
-    memory_text: str | None = None,
 ) -> list[Message]:
-    """把检索结果和长期记忆拼成发给大模型的 messages。"""
+    """把检索结果拼成发给大模型的 messages。"""
     blocks: list[str] = []
     for rank, result in enumerate(results, 1):
         section = " > ".join(result.get("section_path") or [])
@@ -79,10 +78,8 @@ def build_messages(
             f" | {_pages(result)} | 章节：{section}\n"
             f"原文：{result.get('text', '')}"
         )
-    memory = f"{memory_text.strip()}\n\n" if memory_text else ""
     user = (
-        memory
-        + f"问题：{query}\n\n"
+        f"问题：{query}\n\n"
         "原文片段：\n\n"
         + "\n\n".join(blocks)
         + "\n\n请根据以上片段回答，并在结论后标注 [编号]。"
@@ -100,7 +97,6 @@ def prepare_answer(
     mode: str = "hybrid",
     rerank: bool = False,
     structured: bool = False,
-    memory_text: str | None = None,
 ) -> dict[str, Any]:
     """只做检索和提示词拼装，不调用大模型。"""
     search = search_chunks(
@@ -116,7 +112,6 @@ def prepare_answer(
                 query,
                 results,
                 structured=structured,
-                memory_text=memory_text,
             )
             if results
             else []
@@ -216,7 +211,6 @@ def _generate_from_prepared(
     structured: bool,
     llm_client: LLMClient,
     log_to_db: bool,
-    memory_text: str | None,
     started: float,
 ) -> dict[str, Any]:
     """给定已经检索好的片段，只负责调用大模型并校验引用。"""
@@ -233,7 +227,6 @@ def _generate_from_prepared(
                 query,
                 results,
                 structured=False,
-                memory_text=memory_text,
             )
             raw = llm_client.chat(plain_messages)
             payload = {
@@ -289,7 +282,6 @@ def answer_from_search(
     config_value: LLMConfig | None = None,
     client: LLMClient | None = None,
     log_to_db: bool = True,
-    memory_text: str | None = None,
 ) -> dict[str, Any]:
     """基于已经检索好的 search 结果生成答案。
 
@@ -311,7 +303,6 @@ def answer_from_search(
         query,
         results,
         structured=structured,
-        memory_text=memory_text,
     )
     llm_client = client or build_client(config_value or load_llm_config())
     return _generate_from_prepared(
@@ -323,7 +314,6 @@ def answer_from_search(
         structured=structured,
         llm_client=llm_client,
         log_to_db=log_to_db,
-        memory_text=memory_text,
         started=started,
     )
 
@@ -337,7 +327,6 @@ def answer_question(
     config_value: LLMConfig | None = None,
     client: LLMClient | None = None,
     log_to_db: bool = True,
-    memory_text: str | None = None,
 ) -> dict[str, Any]:
     """检索 + 调用大模型，返回答案和出处。
 
@@ -351,7 +340,6 @@ def answer_question(
         mode=mode,
         rerank=rerank,
         structured=structured,
-        memory_text=memory_text,
     )
     search = prepared["search"]
     if search.get("error"):
@@ -374,6 +362,5 @@ def answer_question(
         structured=structured,
         llm_client=llm_client,
         log_to_db=log_to_db,
-        memory_text=memory_text,
         started=started,
     )
