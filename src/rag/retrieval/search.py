@@ -100,13 +100,6 @@ def _snippet(text: str, query_tokens: list[str], width: int = 220) -> str:
     return snippet.replace("\n", " ").strip()
 
 
-EXACT_MODEL_TERMS = re.compile(
-    r"\b(?:FiD|REALM|REPLUG|GTR|GraphRAG|BERT|GPT|DPR|ColBERT|FAISS|ScaNN|"
-    r"Self-RAG|RAG-RL|Toolformer|ReAct)\b",
-    re.I,
-)
-
-
 def _semantic_conf(cosine: float) -> float:
     """把余弦相似度粗略映射成 0～1 的把握程度。"""
     return max(0.0, min(1.0, (cosine - 0.30) / 0.40))
@@ -155,29 +148,22 @@ def _context_factor(
     doc: dict[str, Any],
     q_set: set[str],
     query_tokens: list[str],
-    content_terms: set[str],
     definitional: bool,
-    mode: str,
 ) -> float:
-    """向量/混合模式下用的轻量规则加成。
+    """纯向量模式下用的轻量规则加成。
 
-    向量模式尽量尊重余弦相似度的排序，规则只做很小的修正；
-    混合模式里 BM25 已经带过一轮较强的章节/摘要加权，这里也只是轻加。
+    RRF 只看两路名次，不再把规则加成混进融合分数；
+    这里只服务 `--mode vector`，尽量尊重余弦相似度的排序。
     """
     factor = 1.0
-    path_tokens = set(tokenize(" ".join(doc.get("section_path", []))))
-    # 只算有区分度的词，避免“RAG”这种每块都有的词把章节权重拉满
-    path_hits = (q_set & content_terms) & path_tokens
-    if mode == "hybrid" and path_hits:
-        factor *= 1 + 0.05 * min(len(path_hits), 2)
     title_overlap = _topic_overlap(q_set, doc.get("paper_title", ""))
     if title_overlap:
         factor *= 1.01
     if doc.get("type") == "abstract":
         if definitional and title_overlap >= 0.5:
-            factor *= 1.25 if mode == "vector" else 1.15
+            factor *= 1.25
     phrase_hits = _phrase_bonus(query_tokens, doc.get("text", "")) - 1
-    factor *= 1 + phrase_hits * (0.25 if mode == "vector" else 0.35)
+    factor *= 1 + phrase_hits * 0.25
     if len(re.findall(r"[（(]\d{1,2}[）)]", doc.get("text", ""))) >= 4:
         factor *= 0.98
     return factor
@@ -431,36 +417,47 @@ def search_chunks(
         )[:rank_limit]
         for i in ranked:
             scores[i] = vector_scores[i] * _context_factor(
-                docs[i], q_set, query_for_score, set(effective), definitional, "vector"
+                docs[i], q_set, query_for_score, definitional
             )
         ranked.sort(key=lambda i: scores[i], reverse=True)
         conf_scores = [_semantic_conf(v) for v in vector_scores]
 
-    else:  # hybrid：两路分数归一化后加权
+    else:  # hybrid：RRF（Reciprocal Rank Fusion）
         assert vector_scores is not None
-        max_bm25 = max(bm25_scores) if bm25_scores else 0.0
-        max_vec = max(vector_scores) if vector_scores else 0.0
-        # 具体模型名（FiD、REPLUG 等）出现时，更相信关键词精确匹配；
-        # 纯自然语言问法，更相信向量语义。
-        weight = (
-            config.HYBRID_EXACT_WEIGHT
-            if EXACT_MODEL_TERMS.search(query)
-            else config.HYBRID_BM25_WEIGHT
+        # 两路各自按分数排名，只使用名次做融合：
+        # RRF = w_bm25 / (k + bm25_rank) + w_vec / (k + vec_rank)
+        # 这样不用把 BM25 分和余弦相似度强行换算到同一个量纲。
+        bm25_rank = {
+            idx: rank
+            for rank, idx in enumerate(bm25_ranked, 1)
+        }
+        vector_ranked = sorted(
+            [
+                i
+                for i in range(len(docs))
+                if vector_scores[i] >= config.VECTOR_MIN_COSINE
+            ],
+            key=lambda i: vector_scores[i],
+            reverse=True,
         )
-        candidates: list[int] = []
-        for i in range(len(docs)):
-            bm25_norm = bm25_scores[i] / max_bm25 if max_bm25 > 0 else 0.0
-            vec_norm = max(0.0, vector_scores[i]) / max_vec if max_vec > 0 else 0.0
-            if vector_scores[i] < config.VECTOR_MIN_COSINE:
-                vec_norm = 0.0
-            mixed = weight * bm25_norm + (1 - weight) * vec_norm
-            if mixed <= 0:
-                continue
-            mixed *= 100 * _context_factor(
-                docs[i], q_set, query_for_score, set(effective), definitional, "hybrid"
-            )
-            scores[i] = mixed
-            candidates.append(i)
+        vector_rank = {
+            idx: rank
+            for rank, idx in enumerate(vector_ranked, 1)
+        }
+
+        candidates = sorted(set(bm25_rank) | set(vector_rank))
+        for i in candidates:
+            rrf_score = 0.0
+            if i in bm25_rank:
+                rrf_score += config.RRF_BM25_WEIGHT / (
+                    config.RRF_K + bm25_rank[i]
+                )
+            if i in vector_rank:
+                rrf_score += config.RRF_VECTOR_WEIGHT / (
+                    config.RRF_K + vector_rank[i]
+                )
+            scores[i] = rrf_score
+
         ranked = sorted(candidates, key=lambda i: scores[i], reverse=True)
         conf_scores = [
             max(coverage_by_doc[i], _semantic_conf(vector_scores[i]))
@@ -539,7 +536,7 @@ def search_chunks(
         results.append(
             {
                 "rank": rank,
-                "score": round(scores[idx], 4),
+                "score": round(scores[idx], 6),
                 "coverage": round(coverage_by_doc[idx], 2),
                 "confidence": confidence,
                 "matched_terms": matched_by_doc[idx],
@@ -580,6 +577,12 @@ def search_chunks(
         "rerank_error": rerank_error,
         "results": results,
     }
+    if effective_mode == "hybrid":
+        payload["rrf_k"] = config.RRF_K
+        payload["rrf_weights"] = {
+            "bm25": config.RRF_BM25_WEIGHT,
+            "vector": config.RRF_VECTOR_WEIGHT,
+        }
     if expanded_tokens != query_tokens:
         payload["expanded_tokens"] = expanded_tokens
     return payload

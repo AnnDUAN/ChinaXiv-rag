@@ -42,10 +42,12 @@ VECTOR_MIN_COSINE = 0.20
 # 当前语料很小，pgvector 先用精确扫描，保证和原来的 npz 结果一致；
 # 数据量大了再把这个改成 False，走 HNSW 近似检索。
 PGVECTOR_EXACT = True
-# 混合检索里 BM25 的权重。语义改写问题多，所以默认向量占大头；
-# 问题里出现具体模型名时，提高 BM25 的权重，保证专有名词命中。
-HYBRID_BM25_WEIGHT = 0.15
-HYBRID_EXACT_WEIGHT = 0.55
+# 混合检索用 RRF（Reciprocal Rank Fusion）合并两路排名。
+# 只使用名次，不使用原始分数，避免 BM25 和余弦相似度量纲不同。
+# 权重先各占一半，后面可以用评测集重新调。
+RRF_K = 60
+RRF_BM25_WEIGHT = 0.5
+RRF_VECTOR_WEIGHT = 0.5
 
 # 重排序参数
 # 本地交叉编码器：把“问题 + 候选段落”放在一起判断相关性。
