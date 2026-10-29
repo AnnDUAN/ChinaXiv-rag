@@ -10,6 +10,10 @@
 用法：
     .venv-docling/Scripts/python.exe scripts/docling_trial.py
     .venv-docling/Scripts/python.exe scripts/docling_trial.py --ids 202610.00009
+
+建议转换时加上 --image-export-mode placeholder，避免 Markdown 里出现
+很长的 base64 图片字符串：
+    docling convert ... --image-export-mode placeholder
 """
 
 from __future__ import annotations
@@ -24,7 +28,12 @@ from typing import Any, Iterable
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from rag.common.utils import clean_text, hard_split, split_sentences  # noqa: E402
+from rag.common.utils import (  # noqa: E402
+    clean_text,
+    hard_split,
+    normalize_spaces,
+    split_sentences,
+)
 
 TARGET = 450
 MAX_LEN = 600
@@ -180,24 +189,180 @@ def _table_chunks(
     return chunks
 
 
+_AFFILIATION_WORDS = ("大学", "学院", "研究所", "研究院", "实验室", "研究中心")
+_AUTHOR_SKIP_WORDS = (
+    "预印本",
+    "投稿前",
+    "同行评审",
+    "中图分类号",
+    "文献标识码",
+    "收稿日期",
+    "基金项目",
+    "作者简介",
+    "通信作者",
+    "DOI",
+)
+
+
+def _clean_affiliation(text: str) -> str:
+    text = normalize_spaces(text)
+    text = re.sub(r"^\d{1,2}\s*[.、]?\s*", "", text)
+    if text.startswith(("（", "(")) and text.endswith(("）", ")")):
+        text = text[1:-1]
+    return text.strip("（）() ")
+
+
+def _parse_author_names(text: str) -> list[str]:
+    text = normalize_spaces(text)
+    text = re.sub(r"^作者\s*[：:]\s*", "", text)
+    text = re.sub(r"[（(][^）)]*[）)]", "", text)
+    text = re.sub(r"(?<=[一-鿿])\s*\d+(?:[,，]\d+)*[*†‡]*", "", text)
+    text = re.sub(r"[*†‡​]+$", "", text).strip(" ,，、;；")
+    raw = [
+        item.strip()
+        for item in re.split(r"[，,、;；\s]+", text)
+        if item.strip() and len(item.strip()) <= 20
+    ]
+    names: list[str] = []
+    for item in raw:
+        if re.fullmatch(r"[\d\W_]+", item):
+            continue
+        if (
+            re.fullmatch(r"[一-鿿]", item)
+            and names
+            and re.fullmatch(r"[一-鿿]", names[-1])
+        ):
+            names[-1] += item
+        else:
+            names.append(item)
+    return names
+
+
+def extract_meta(doc: dict[str, Any], paper_id: str) -> dict[str, Any]:
+    """从 Docling 的首页阅读顺序里整理标题、作者和单位。"""
+    title_parts: list[str] = []
+    front: list[str] = []
+    started = False
+
+    for kind, item in _body_items(doc):
+        label = item.get("label")
+        if label in {"page_header", "page_footer"}:
+            continue
+        text = clean_text(item.get("text") or "")
+        if not started:
+            if kind == "texts" and label == "section_header" and text:
+                title_parts.append(text)
+                continue
+            if title_parts:
+                started = True
+            else:
+                continue
+
+        if kind == "texts" and label == "section_header":
+            # 摘要之前的其它标题不再算元数据
+            break
+        if kind == "texts" and label in {"text", "list_item"} and text:
+            front.append(text)
+
+    title = "".join(title_parts).strip()
+    title = title.replace("--", "——")
+    title = re.sub(r"(?<=[一-鿿])\s+(?=[一-鿿])", "", title)
+    title = re.sub(r"\*+$", "", title).strip()
+    if not title:
+        title = paper_id
+
+    authors: list[str] = []
+    affiliations: list[str] = []
+    for text in front:
+        if any(word in text for word in _AUTHOR_SKIP_WORDS):
+            continue
+
+        has_affiliation = any(word in text for word in _AFFILIATION_WORDS)
+        # “刘海熠（武汉东湖学院）”这种，作者在前面、单位在括号里；
+        # “1（中国地质大学（北京）……”这种，整行都是单位。
+        prefix = re.split(r"[（(]", text, 1)[0]
+        prefix = re.sub(r"^作者\s*[：:]\s*", "", prefix).strip()
+        looks_like_person = bool(
+            re.fullmatch(r"[一-鿿]{2,4}", prefix)
+            or re.fullmatch(r"[A-Za-z .'\-]{2,60}", prefix)
+        )
+
+        if has_affiliation and not looks_like_person:
+            cleaned = _clean_affiliation(text)
+            if cleaned and cleaned not in affiliations:
+                affiliations.append(cleaned)
+            continue
+
+        names = _parse_author_names(text)
+        for name in names:
+            if name not in authors:
+                authors.append(name)
+
+        if has_affiliation and looks_like_person:
+            for inside in re.findall(r"[（(]([^）)]+)[）)]", text):
+                if any(word in inside for word in _AFFILIATION_WORDS):
+                    cleaned = _clean_affiliation(inside)
+                    if cleaned and cleaned not in affiliations:
+                        affiliations.append(cleaned)
+
+    return {
+        "paper_id": paper_id,
+        "title": title,
+        "authors": authors,
+        "affiliations": affiliations,
+    }
+
+
 def _load_title(paper_id: str, doc: dict[str, Any]) -> str:
-    old = ROOT / "data" / "chunks" / f"{paper_id}.json"
-    if old.exists():
-        try:
-            data = json.loads(old.read_text(encoding="utf-8"))
-            title = (data.get("meta") or {}).get("title")
-            if title:
-                return str(title)
-        except Exception:
-            pass
-    for text in doc.get("texts", []):
-        if text.get("label") == "section_header" and text.get("text"):
-            return clean_text(text["text"])
-    return paper_id
+    meta = extract_meta(doc, paper_id)
+    return str(meta.get("title") or paper_id)
+
+
+def write_clean_markdown(
+    raw_path: Path,
+    meta: dict[str, Any],
+    out_dir: Path,
+) -> Path:
+    """把 Docling 的原始 Markdown 整理成可读版本。
+
+    - 合并被拆成多行的标题；
+    - 用整理后的作者/单位替换脏数据；
+    - 把 base64 图片换成占位符。
+    """
+    text = raw_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    start = 0
+    for i, line in enumerate(lines):
+        if re.match(r"^#{1,3}\s*(摘\s*要|Abstract)\b", line, re.I):
+            start = i
+            break
+    body = "\n".join(lines[start:]) if start else text
+    body = re.sub(
+        r"!\[[^\]]*\]\(data:image/[^)]+\)",
+        "![图片](图片占位)",
+        body,
+    )
+
+    front = [f"# {meta.get('title') or ''}", ""]
+    authors = meta.get("authors") or []
+    affiliations = meta.get("affiliations") or []
+    if authors:
+        front.extend(["作者：" + "、".join(authors), ""])
+    if affiliations:
+        front.extend(["单位：" + "；".join(affiliations), ""])
+    front.append("")
+
+    out_path = out_dir / f"{raw_path.stem}.md"
+    out_path.write_text(
+        "\n".join(front) + body + "\n",
+        encoding="utf-8",
+    )
+    return out_path
 
 
 def build_chunks(doc: dict[str, Any], paper_id: str) -> dict[str, Any]:
-    title = _load_title(paper_id, doc)
+    meta = extract_meta(doc, paper_id)
+    title = str(meta.get("title") or paper_id)
     stack: list[tuple[int, str]] = []
     section_path: list[str] = []
     paragraph_buffer: list[str] = []
@@ -306,6 +471,7 @@ def build_chunks(doc: dict[str, Any], paper_id: str) -> dict[str, Any]:
     return {
         "paper_id": paper_id,
         "title": title,
+        "meta": meta,
         "docling_pages": len(doc.get("pages", {})),
         "docling_tables": len(doc.get("tables", [])),
         "docling_texts": len(doc.get("texts", [])),
@@ -328,12 +494,19 @@ def main() -> int:
         default=str(ROOT / "data" / "docling_probe" / "chunks"),
         help="切片输出目录",
     )
+    parser.add_argument(
+        "--clean-dir",
+        default=str(ROOT / "data" / "docling_probe" / "clean"),
+        help="整理后的 Markdown 输出目录",
+    )
     parser.add_argument("--ids", nargs="*", help="只处理这些论文 ID")
     args = parser.parse_args()
 
     json_dir = Path(args.json_dir)
     out_dir = Path(args.out)
+    clean_dir = Path(args.clean_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    clean_dir.mkdir(parents=True, exist_ok=True)
 
     paths = sorted(json_dir.glob("*.json"))
     if args.ids:
@@ -350,6 +523,11 @@ def main() -> int:
             json.dumps(result, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        raw_md = path.with_suffix(".md")
+        if raw_md.exists():
+            write_clean_markdown(
+                raw_md, result["meta"], clean_dir
+            )
         summaries.append(result)
         print(
             f"{path.stem}: 页 {result['docling_pages']} | "
