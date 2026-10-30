@@ -19,9 +19,8 @@
 - 论文列表保存在 `data/catalog.json`，按 `paper_id` 去重；
 - 当前保留了 **106 篇有效 PDF**；
 - 旧的字号解析结果、切片、索引和数据库数据已全部清空；
-- 已生成 **103 篇** MinerU middle JSON 和清洗后的 Markdown：
-  - 先跑了 40 篇 standard；
-  - 剩余 63 篇用 basic 快速补跑，优先保证正文和元数据；
+- 已生成 **103 篇** MinerU middle JSON 和清洗后的 Markdown；
+- 103 篇全部使用 **standard** 档；其中 63 篇先跑过 basic，后来已用 standard 重跑覆盖；
 - 3 篇超大 PDF 按要求跳过，规则和名单见 `data/mineru_skipped.md`；
 - 全量切片、向量索引和数据库还没有重建，等清洗结果确认后再做。
 
