@@ -79,6 +79,21 @@ uv venv --python 3.12 .venv-mineru
 uv pip install --python .venv-mineru\Scripts\python.exe "mineru>=4.0,<5"
 ```
 
+如果 standard 日志里出现 `llama.cpp device discovery unavailable`，说明 MinerU 没找到显卡。Windows 上 `mineru 4.1.0` 和 `mineru-llama-cpp 0.2.0` 有一个 DLL 拆分问题，运行一次补丁脚本：
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.venv\Scripts\python.exe scripts\patch_mineru_llama_probe.py
+```
+
+修好后会看到类似：
+
+```text
+"NVIDIA GeForce RTX 4060 Laptop GPU"
+```
+
+重装 MinerU 后需要再运行一次这个脚本。
+
 ```powershell
 # 1. 下载论文（先抓 1 页列表，再下载所有还没有 PDF 的中文论文）
 .\rag fetch --catalog --pages 1 --download
