@@ -63,10 +63,3 @@ RERANK_CANDIDATES = 30
 # 保留原排序的前几名作为“保底”，避免重排把本来正确的小节顶掉。
 RERANK_ANCHORS = 2
 RERANK_BATCH_SIZE = 16
-
-# 小于正文这个差值的行，视为公式/表格/图注等辅助文字
-SMALL_FONT_DELTA = 1.0
-
-# 页边距：用于识别页眉页脚（按页面高度比例）
-HEADER_RATIO = 0.15
-FOOTER_RATIO = 0.93

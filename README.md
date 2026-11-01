@@ -18,11 +18,12 @@
 - 纯英文标题的论文会在入库前被过滤掉；
 - 论文列表保存在 `data/catalog.json`，按 `paper_id` 去重；
 - 当前保留了 **106 篇有效 PDF**；
-- 旧的字号解析结果、切片、索引和数据库数据已全部清空；
+- 旧的字号解析器代码和旧结果已删除，正式流程只走 MinerU；
 - 已生成 **103 篇** MinerU middle JSON 和清洗后的 Markdown；
 - 103 篇全部使用 **standard** 档；其中 63 篇先跑过 basic，后来已用 standard 重跑覆盖；
 - 3 篇超大 PDF 按要求跳过，规则和名单见 `data/mineru_skipped.md`；
-- 全量切片、向量索引和数据库还没有重建，等清洗结果确认后再做。
+- 已按 MinerU 结果重建 102 篇的切片和索引：4,583 个切片、4,495 个向量；
+- 3 篇超大 PDF 和 1 篇公式密集的教材未入库，数据库待启动后再同步。
 
 个别预印本版式比较特殊（超长、标题没有编号、正文里有大量公式），解析时会给出警告。以 `rag stats` 的输出和 `data/parsed/*.json` 里的 `quality` 为准。
 
@@ -53,9 +54,9 @@
 - **Recall@5**：题目标注的目标论文中，有多少篇在前 5 条里出现过。多论文问题比如“这些论文里有哪些不同路线”，会看 5 条结果覆盖了几篇目标论文；
 - 单论文题目的 Recall@5 只有 0% 或 100%，所以多论文题更能体现这个指标。
 
-### 旧解析器结果（仅留档）
+### 旧评测结果（仅作历史参考）
 
-下面的数字来自旧的字号解析器和旧切片，**不是 MinerU 重建后的当前结果**。等全量 106 篇重新入库后需要重跑一遍，再更新这里。
+下面的数字来自旧的字号解析器和旧切片，**不是 MinerU 重建后的当前结果**。新切片已经重建，但还没有重跑评测。
 
 | 测试集 | 不重排 Hit@5 | 不重排 Recall@5 | 重排 Hit@5 | 重排 Recall@5 |
 |---|---:|---:|---:|---:|
@@ -146,13 +147,9 @@ docker compose up -d
 
 # 查看已经入库了什么
 .\rag stats
-
-# 检查旧字号解析器在某一页的细节（只做诊断，不参与现在的入库流程）
-.\rag inspect 202609.00318 --page 1
-.\rag inspect 202609.00318 --page 1 --raw
 ```
 
-`inspect` 是旧字号解析器的诊断工具，现在正式入库走 MinerU，所以调 MinerU 清洗规则时优先看 `data/mineru_clean/*.md` 和 `parsed/*.json` 里的 `quality`。旧命令 `--raw` 仍然可以看原始行，`--all-removed` 可以看全部被删除的行。
+调 MinerU 清洗规则时，优先看 `data/mineru_clean/*.md` 和 `data/parsed/*.json` 里的 `quality`。
 
 ```powershell
 # 可选：建立向量索引，用 --mode hybrid / vector 检索
@@ -601,7 +598,6 @@ agentic_rag/
     ingestion/              数据入库
       downloader.py         ChinaXiv 列表抓取 / PDF 下载
       mineru_parser.py      MinerU JSON → 清理后的章节、表格、公式、元数据
-      pdf_parser.py         旧字号解析器，只保留给 inspect 诊断
       chunker.py            章节 → 检索切片（表格/公式感知）
     indexing/               建立索引
       bm25.py               分词 + BM25

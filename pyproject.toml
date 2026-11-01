@@ -8,7 +8,6 @@ version = "0.1.0"
 description = "Local paper RAG with PostgreSQL/pgvector, hybrid retrieval, rerank and structured Q&A"
 requires-python = ">=3.10"
 dependencies = [
-  "pymupdf>=1.24",
   "jieba>=0.42",
   "requests>=2.31",
   "numpy>=1.26",

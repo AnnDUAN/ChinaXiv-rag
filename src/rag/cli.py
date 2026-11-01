@@ -26,7 +26,6 @@ from .ingestion.downloader import (
     merge_catalog_file,
 )
 from .ingestion.mineru_parser import parse_mineru_json
-from .ingestion.pdf_parser import inspect_page
 from .retrieval.search import load_chunks, search_chunks
 
 MODE_NAMES = {
@@ -921,81 +920,6 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resolve_pdf_arg(value: str) -> Path:
-    path = Path(value)
-    if path.exists():
-        return path
-    for candidate in (config.PDF_DIR / value, config.PDF_DIR / f"{value}.pdf"):
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(
-        f"找不到 PDF：{value}\n"
-        f"可以直接写 data/pdfs 下的文件名或论文编号，例如 202609.00318。"
-    )
-
-
-def cmd_inspect(args: argparse.Namespace) -> int:
-    """只检查一页的解析细节，不写任何数据文件。"""
-    try:
-        pdf_path = _resolve_pdf_arg(args.pdf)
-        info = inspect_page(pdf_path, page_no=args.page)
-    except Exception as exc:
-        print(f"检查失败：{exc}")
-        return 1
-
-    width, height = info["page_size"]
-    print(f"文件：{info['pdf']}")
-    print(
-        f"第 {info['page']}/{info['page_count']} 页 | "
-        f"页面 {width}×{height} | 正文标准字号 {info['body_font_size']}"
-    )
-    ref = info.get("reference_start")
-    print(f"参考文献起点：{ref if ref else '未识别到'}")
-    front = info.get("front_matter_end")
-    print(f"前置内容截止：{front if front else '未识别到（按第一页处理）'}")
-
-    removed = info["removed_lines"]
-    counts = info.get("page_removed_counts", {})
-    print(f"\n本页删除 {len(removed)} 行：" + " | ".join(
-        f"{reason} {count}" for reason, count in counts.items()
-    ))
-    if not removed:
-        print("  （无）")
-    groups: dict[str, list[dict]] = {}
-    for item in removed:
-        groups.setdefault(item["reason"], []).append(item)
-    for reason, items in groups.items():
-        show = len(items) if args.all_removed else min(len(items), 8)
-        print(f"\n  [{reason}] {len(items)} 行")
-        for item in items[:show]:
-            text = item["text"].replace("\n", " ")
-            direction = tuple(item["direction"])
-            print(
-                f"    size={item['size']} dir={direction} | {text[:100]}"
-            )
-        if show < len(items):
-            print(f"    …… 还有 {len(items) - show} 行（加 --all-removed 查看）")
-
-    print(
-        f"\n本页保留 {len(info['kept_lines'])} 行 | "
-        f"正文字符 {len(info['text'])}"
-    )
-    body = info["text"]
-    print(body[:1500] + ("…" if len(body) > 1500 else ""))
-
-    if args.raw:
-        print(f"\n原始行（{len(info['raw_lines'])}）：")
-        for index, line in enumerate(info["raw_lines"], 1):
-            x0, y0, x1, y1 = line["bbox"]
-            mark = " [竖排]" if line["vertical"] else ""
-            print(
-                f"  {index:3d} y={y0:6.1f}-{y1:6.1f} "
-                f"x={x0:6.1f}-{x1:6.1f} size={line['size']:4.1f}"
-                f"{mark} | {line['text'][:100]}"
-            )
-    return 0
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="rag", description="本地论文 RAG：解析、切片、关键词 + 向量检索（暂不接大模型生成）"
@@ -1189,19 +1113,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_fetch.add_argument("--force", action="store_true", help="已存在的 PDF 也重新下载")
     p_fetch.set_defaults(func=cmd_fetch)
-
-    p_inspect = sub.add_parser(
-        "inspect", help="检查单页解析：原始行、删除原因、保留正文（只读）"
-    )
-    p_inspect.add_argument("pdf", help="PDF 路径，或 data/pdfs 下的论文编号")
-    p_inspect.add_argument("--page", type=int, default=1, help="页码，从 1 开始")
-    p_inspect.add_argument(
-        "--raw", action="store_true", help="显示这一页所有原始行及位置"
-    )
-    p_inspect.add_argument(
-        "--all-removed", action="store_true", help="显示所有被删除的行"
-    )
-    p_inspect.set_defaults(func=cmd_inspect)
 
     return parser
 
