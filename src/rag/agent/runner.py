@@ -1,13 +1,10 @@
-"""一个很小、可控的检索 Agent。
+"""一个小而快的检索 Agent。
 
-流程只有四种状态：
-retrieve（检索）→ assess（判断够不够）→ answer（回答）→ done（结束）
+流程只有三步：
+analyze（分析意图和拆查询）→ retrieve（批量检索）→ answer（回答）→ done
 
-它不会自由调用一堆工具，也不会无限循环：
-- 最多补查 max_search_rounds 轮；
-- 最多执行 max_steps 个步骤；
-- 模型想重复同一个检索词时直接停止补查；
-- 补查没有带回新片段时也停止。
+和旧版相比，不再在每轮检索后让模型判断“证据够不够”，
+而是在开头一次性决定要查哪些查询，减少大模型调用和等待时间。
 """
 
 from __future__ import annotations
@@ -19,7 +16,7 @@ from .. import config
 from ..generation.answer import NO_EVIDENCE_TEXT, answer_from_search
 from ..llm import LLMClient, LLMConfig, build_client
 from ..retrieval.search import search_chunks
-from .assess import assess_evidence
+from .analyze import analyze_question
 from .checkpoint import CheckpointStore, PostgresCheckpointStore
 from .state import AgentState, AgentStatus
 
@@ -49,7 +46,7 @@ class AgentRunner:
         search_fn: Callable[..., dict[str, Any]] | None = None,
         answer_fn: Callable[..., dict[str, Any]] | None = None,
         max_steps: int = 8,
-        max_search_rounds: int = 3,
+        max_search_rounds: int = 4,
         top_k: int = config.DEFAULT_TOP_K,
         mode: str = "hybrid",
         rerank: bool = False,
@@ -86,6 +83,10 @@ class AgentRunner:
             state = self.store.load(resume_run_id)
             if state is None:
                 raise AgentError(f"找不到 Agent 运行 #{resume_run_id}")
+            if state.version < 2:
+                raise AgentError(
+                    "旧版 Agent 进度和新流程不兼容，请重新发起一次任务。"
+                )
             if state.status is AgentStatus.COMPLETED:
                 return self._result(resume_run_id, state, resumed=True)
 
@@ -145,10 +146,13 @@ class AgentRunner:
                     f"{state.max_steps + 2}` 继续。"
                 )
 
-            if state.phase == "retrieve":
+            if state.phase == "analyze":
+                self._analyze(run_id, state)
+            elif state.phase == "retrieve":
                 self._retrieve(run_id, state)
             elif state.phase == "assess":
-                self._assess(run_id, state)
+                # 兼容旧 checkpoint；新流程不再做单独的证据判断。
+                state.phase = "answer"
             elif state.phase == "answer":
                 self._answer(run_id, state)
             else:
@@ -157,21 +161,62 @@ class AgentRunner:
     # ------------------------------------------------------------------
     # 三个节点
     # ------------------------------------------------------------------
-    def _retrieve(self, run_id: int, state: AgentState) -> None:
-        if state.search_rounds >= state.max_search_rounds:
-            state.phase = "answer"
-            self.store.save(run_id, state)
-            return
+    def _analyze(self, run_id: int, state: AgentState) -> None:
+        step_no = state.step_count + 1
+        step_id = self.store.start_step(
+            run_id,
+            step_no,
+            "analyze",
+            {"question": state.question},
+        )
+        try:
+            analysis, analysis_error = analyze_question(
+                state.question,
+                client=self._get_client(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.store.finish_step(step_id, "failed", error=str(exc))
+            raise
 
-        query = (state.pending_query or state.question).strip()
-        if not query:
-            raise AgentError("检索词为空。")
-        if any(
-            _normalize_query(query) == _normalize_query(old)
-            for old in state.queries
-        ):
-            state.pending_query = None
-            state.phase = "assess"
+        state.analysis = analysis.model_dump()
+        if analysis_error:
+            state.analysis["error"] = _short(analysis_error, 300)
+
+        queries = [analysis.rewritten_query, *analysis.sub_queries]
+        queries = [
+            query
+            for query in queries
+            if query and query.strip()
+        ]
+        # 同一批查询内先去重，避免重复搜索。
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for query in queries:
+            key = _normalize_query(query)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(query)
+        state.pending_queries = deduped[: state.max_search_rounds]
+        state.phase = "retrieve"
+        state.step_count = step_no
+        state.error = None
+
+        output = {
+            "intent": analysis.intent,
+            "rewritten_query": analysis.rewritten_query,
+            "sub_queries": analysis.sub_queries,
+            "queries": state.pending_queries,
+        }
+        if analysis_error:
+            output["error"] = _short(analysis_error, 300)
+        self.store.finish_step(step_id, "success", output=output)
+        self.store.save(run_id, state)
+
+    def _retrieve(self, run_id: int, state: AgentState) -> None:
+        queries = [query for query in state.pending_queries if query.strip()]
+        if not queries:
+            state.phase = "answer"
             self.store.save(run_id, state)
             return
 
@@ -181,134 +226,89 @@ class AgentRunner:
             step_no,
             "retrieve",
             {
-                "query": query,
-                "round": state.search_rounds + 1,
+                "queries": queries,
                 "top_k": state.top_k,
                 "mode": state.mode,
                 "rerank": state.rerank,
             },
         )
-        try:
-            payload = self.search_fn(
-                query,
-                top_k=state.top_k,
-                mode=state.mode,
-                rerank=state.rerank,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.store.finish_step(step_id, "failed", error=str(exc))
-            raise
 
-        if payload.get("error"):
-            message = str(payload["error"])
-            self.store.finish_step(step_id, "failed", error=message)
-            raise AgentError(message)
-
-        seen = {
-            str(item.get("chunk_id"))
-            for item in state.results
+        # 保留旧结果，支持从 checkpoint 继续。
+        merged = list(state.results)
+        by_id: dict[str, dict[str, Any]] = {
+            str(item.get("chunk_id")): item
+            for item in merged
             if item.get("chunk_id")
         }
-        added = 0
-        merged = list(state.results)
-        for item in payload.get("results") or []:
-            chunk_id = str(item.get("chunk_id") or "")
-            if not chunk_id or chunk_id in seen:
-                continue
-            copied = dict(item)
-            copied["agent_query"] = query
-            copied["agent_round"] = state.search_rounds + 1
-            merged.append(copied)
-            seen.add(chunk_id)
-            added += 1
+        searches: list[dict[str, Any]] = []
+        executed: list[str] = []
 
-        state.results = merged
-        state.search_rounds += 1
-        state.queries.append(query)
-        state.pending_query = None
-        summary = {
-            "query": query,
-            "round": state.search_rounds,
-            "mode": payload.get("mode"),
-            "result_count": len(payload.get("results") or []),
-            "new_count": added,
-            "vector_error": payload.get("vector_error"),
-            "rerank_applied": bool(payload.get("rerank_applied")),
-        }
-        state.searches.append(summary)
-        state.phase = "assess"
-        state.step_count = step_no
-        state.error = None
-
-        self.store.finish_step(step_id, "success", output=summary)
-        self.store.save(run_id, state)
-
-    def _assess(self, run_id: int, state: AgentState) -> None:
-        if not state.results:
-            state.phase = "answer"
-            self.store.save(run_id, state)
-            return
-
-        step_no = state.step_count + 1
-        step_id = self.store.start_step(
-            run_id,
-            step_no,
-            "assess",
-            {
-                "evidence_count": len(state.results),
-                "search_rounds": state.search_rounds,
-            },
-        )
         try:
-            assessment, assessment_error = assess_evidence(
-                state.question,
-                state.results,
-                state.queries,
-                client=self._get_client(),
-                max_evidence=self.max_evidence,
-            )
+            for query in queries:
+                payload = self.search_fn(
+                    query,
+                    top_k=state.top_k,
+                    mode=state.mode,
+                    rerank=state.rerank,
+                )
+                if payload.get("error"):
+                    raise AgentError(str(payload["error"]))
+
+                added = 0
+                for item in payload.get("results") or []:
+                    chunk_id = str(item.get("chunk_id") or "")
+                    if not chunk_id:
+                        continue
+                    if chunk_id in by_id:
+                        existing = by_id[chunk_id]
+                        related = existing.setdefault(
+                            "agent_queries",
+                            [existing.get("agent_query")],
+                        )
+                        if query not in related:
+                            related.append(query)
+                        continue
+                    copied = dict(item)
+                    copied["agent_query"] = query
+                    copied["agent_queries"] = [query]
+                    merged.append(copied)
+                    by_id[chunk_id] = copied
+                    added += 1
+
+                searches.append(
+                    {
+                        "query": query,
+                        "mode": payload.get("mode"),
+                        "result_count": len(payload.get("results") or []),
+                        "new_count": added,
+                        "vector_error": payload.get("vector_error"),
+                        "rerank_applied": bool(
+                            payload.get("rerank_applied")
+                        ),
+                    }
+                )
+                executed.append(query)
         except Exception as exc:  # noqa: BLE001
             self.store.finish_step(step_id, "failed", error=str(exc))
             raise
 
-        record = assessment.model_dump()
-        record["round"] = state.search_rounds
-        if assessment_error:
-            record["error"] = assessment_error
-        state.assessments.append(record)
-
-        last_new = (
-            int(state.searches[-1].get("new_count") or 0)
-            if state.searches
-            else 0
+        state.results = merged
+        state.queries = list(
+            dict.fromkeys([*state.queries, *executed])
         )
-        if assessment.sufficient:
-            state.phase = "answer"
-            state.pending_query = None
-        elif (
-            assessment.next_query
-            and state.search_rounds < state.max_search_rounds
-            and last_new > 0
-        ):
-            state.phase = "retrieve"
-            state.pending_query = assessment.next_query
-        else:
-            # 没给出新检索词、补查没有新片段、或者轮数用完了，直接收尾。
-            state.phase = "answer"
-            state.pending_query = None
-
+        state.pending_queries = []
+        state.search_rounds = len(state.queries)
+        state.searches.extend(searches)
+        state.phase = "answer"
         state.step_count = step_no
         state.error = None
-        output = {
-            "sufficient": assessment.sufficient,
-            "missing": assessment.missing,
-            "next_query": assessment.next_query,
-            "reason": assessment.reason,
-        }
-        if assessment_error:
-            output["error"] = _short(assessment_error, 300)
 
-        self.store.finish_step(step_id, "success", output=output)
+        summary = {
+            "queries": executed,
+            "result_count": len(merged),
+            "new_count": sum(item["new_count"] for item in searches),
+        }
+        self.store.finish_step(step_id, "success", output=summary)
         self.store.save(run_id, state)
 
     def _answer(self, run_id: int, state: AgentState) -> None:
@@ -331,12 +331,16 @@ class AgentRunner:
                 copied["rank"] = index
                 evidence.append(copied)
 
+            analysis = state.analysis or {}
             search = {
                 "query": state.question,
                 "mode": state.mode,
                 "results": evidence,
                 "candidate_count": len(evidence),
                 "agent": True,
+                "agent_intent": analysis.get("intent"),
+                "agent_rewritten_query": analysis.get("rewritten_query"),
+                "agent_sub_queries": analysis.get("sub_queries") or [],
                 "agent_rounds": state.search_rounds,
                 "agent_queries": list(state.queries),
             }
@@ -370,7 +374,7 @@ class AgentRunner:
         state.answer = payload
         state.status = AgentStatus.COMPLETED
         state.phase = "done"
-        state.pending_query = None
+        state.pending_queries = []
         state.step_count = step_no
         state.error = None
 
@@ -405,8 +409,9 @@ class AgentRunner:
             "phase": state.phase,
             "step_count": state.step_count,
             "search_rounds": state.search_rounds,
+            "analysis": state.analysis,
             "queries": list(state.queries),
-            "assessments": list(state.assessments),
+            "searches": list(state.searches),
             "answer": state.answer,
             "error": state.error,
             "resumed": resumed,

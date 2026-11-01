@@ -543,7 +543,9 @@ def _json_short(value: object, limit: int = 320) -> str:
 
 
 def _print_agent_result(result: dict) -> None:
-    """打印 Agent 的结果和每一轮判断摘要。"""
+    """打印 Agent 的分析、检索和回答摘要。"""
+    from .agent.analyze import INTENT_LABELS
+
     status_names = {
         "completed": "完成",
         "failed": "失败",
@@ -551,31 +553,31 @@ def _print_agent_result(result: dict) -> None:
     }
     status = status_names.get(result.get("status"), result.get("status"))
     resumed = "（从存档继续）" if result.get("resumed") else ""
+    analysis = result.get("analysis") or {}
+    intent = analysis.get("intent")
+    intent_label = INTENT_LABELS.get(intent, intent or "—")
     print(
         f"\nAgent 运行 #{result.get('run_id')} | {status}{resumed} | "
-        f"检索 {result.get('search_rounds', 0)} 轮 | "
+        f"意图 {intent_label} | "
+        f"检索 {result.get('search_rounds', 0)} 次 | "
         f"{result.get('step_count', 0)} 步"
     )
-    queries = result.get("queries") or []
-    if queries:
-        print("检索词：" + " → ".join(queries))
+    if analysis:
+        print(f"改写查询：{analysis.get('rewritten_query') or '—'}")
+        sub_queries = analysis.get("sub_queries") or []
+        if sub_queries:
+            print("子查询：")
+            for query in sub_queries:
+                print(f"  - {query}")
+        if analysis.get("error"):
+            print(f"⚠ 分析失败，已改用原问题：{analysis['error']}")
 
-    for index, assessment in enumerate(
-        result.get("assessments") or [], 1
-    ):
-        if assessment.get("sufficient"):
-            verdict = "证据足够"
-        else:
-            verdict = "证据不足"
-            missing = assessment.get("missing")
-            if missing:
-                verdict += f"（缺：{missing}）"
-        print(f"  判断 {index}：{verdict}")
-        next_query = assessment.get("next_query")
-        if next_query:
-            print(f"    下一轮检索：{next_query}")
-        if assessment.get("error"):
-            print(f"    ⚠ 判断过程有问题：{assessment['error']}")
+    for search in result.get("searches") or []:
+        print(
+            f"  检索：{search.get('query')} | "
+            f"返回 {search.get('result_count', 0)} 条 | "
+            f"新增 {search.get('new_count', 0)} 条"
+        )
 
     if result.get("error"):
         print(f"\n失败原因：{result['error']}")
@@ -1020,20 +1022,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_db_stats.set_defaults(func=cmd_db)
 
     p_agent = sub.add_parser(
-        "agent", help="多步检索 Agent：证据不够时补查，并保存运行进度"
+        "agent", help="检索 Agent：先分析意图和拆查询，再批量检索并回答"
     )
     agent_sub = p_agent.add_subparsers(
         dest="agent_command", required=True
     )
 
     agent_ask = agent_sub.add_parser(
-        "ask", help="运行一次 Agent 问答（需要 PostgreSQL 和大模型）"
+        "ask", help="运行一次 Agent 问答（先分析意图和拆查询）"
     )
     agent_ask.add_argument("query")
     agent_ask.add_argument("-k", type=int, default=config.DEFAULT_TOP_K)
     agent_ask.add_argument("--mode", choices=mode_choices, default="hybrid")
     agent_ask.add_argument(
-        "--rerank", action="store_true", help="每轮检索都启用重排序"
+        "--rerank", action="store_true", help="检索时启用重排序"
     )
     agent_ask.add_argument(
         "--max-steps", type=int, default=8, help="最多执行几个步骤，默认 8"
@@ -1041,8 +1043,8 @@ def build_parser() -> argparse.ArgumentParser:
     agent_ask.add_argument(
         "--max-search-rounds",
         type=int,
-        default=3,
-        help="最多检索几轮（含第一轮），默认 3",
+        default=4,
+        help="最多执行几次检索（改写查询 + 子查询），默认 4",
     )
     agent_ask.add_argument("--json", action="store_true")
     agent_ask.set_defaults(func=cmd_agent)
@@ -1055,7 +1057,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-steps", type=int, help="可选：覆盖原来的最大步数"
     )
     agent_resume.add_argument(
-        "--max-search-rounds", type=int, help="可选：覆盖原来的最大检索轮数"
+        "--max-search-rounds",
+        type=int,
+        help="可选：覆盖原来的最大检索查询数",
     )
     agent_resume.add_argument("--json", action="store_true")
     agent_resume.set_defaults(func=cmd_agent)

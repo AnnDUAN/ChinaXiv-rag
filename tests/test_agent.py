@@ -1,4 +1,4 @@
-"""Agent 流程和 checkpoint 的离线测试。"""
+"""Agent 新流程和 checkpoint 的离线测试。"""
 
 from __future__ import annotations
 
@@ -6,8 +6,13 @@ import json
 import unittest
 from typing import Any
 
-from rag.agent import AgentRunner
-from rag.agent.assess import clean_next_query
+from rag.agent import (
+    AgentRunner,
+    QueryAnalysis,
+    analyze_question,
+    clean_analysis,
+    infer_intent_hint,
+)
 from rag.llm import Capabilities, MockClient
 from rag.generation.answer import NO_EVIDENCE_TEXT
 
@@ -32,7 +37,19 @@ RESULT_B = {
     "section_path": ["实验"],
     "page_start": 2,
     "page_end": 2,
-    "text": "这是第二轮找到的证据。",
+    "text": "这是子查询找到的证据。",
+}
+
+RESULT_C = {
+    "rank": 1,
+    "score": 0.7,
+    "chunk_id": "chunk-c",
+    "paper_id": "paper-c",
+    "paper_title": "论文 C",
+    "section_path": ["讨论"],
+    "page_start": 3,
+    "page_end": 3,
+    "text": "这是另一个子查询找到的证据。",
 }
 
 
@@ -161,18 +178,18 @@ class MemoryCheckpointStore:
         }
 
 
-def assessment(
-    sufficient: bool,
+def analysis_json(
+    intent: str,
+    rewritten_query: str,
     *,
-    next_query: str = "",
-    missing: str = "",
+    sub_queries: list[str] | None = None,
 ) -> str:
     return json.dumps(
         {
-            "sufficient": sufficient,
-            "next_query": next_query,
-            "missing": missing,
-            "reason": "测试判断",
+            "intent": intent,
+            "rewritten_query": rewritten_query,
+            "sub_queries": sub_queries or [],
+            "reason": "测试分析",
         },
         ensure_ascii=False,
     )
@@ -197,17 +214,19 @@ def make_client(responses: list[str]) -> MockClient:
     )
 
 
-def make_search():
+def make_search(mapping: dict[str, list[dict[str, Any]]] | None = None):
     calls: list[str] = []
+    mapping = mapping or {}
 
     def search(query: str, **kwargs: Any) -> dict[str, Any]:
         calls.append(query)
         if query == "空问题":
             results: list[dict[str, Any]] = []
-        elif "补充" in query:
-            results = [dict(RESULT_B)]
         else:
-            results = [dict(RESULT_A)]
+            results = [
+                dict(item)
+                for item in mapping.get(query, [RESULT_A])
+            ]
         return {
             "query": query,
             "mode": "hybrid",
@@ -220,11 +239,17 @@ def make_search():
 
 
 class AgentFlowTest(unittest.TestCase):
-    def test_sufficient_after_first_search(self) -> None:
+    def test_analysis_rewrites_and_searches_once(self) -> None:
         store = MemoryCheckpointStore()
         search, calls = make_search()
         client = make_client(
-            [assessment(True), answer_json(1, RESULT_A["text"])]
+            [
+                analysis_json(
+                    "definition",
+                    "双沙漏 细腰 智能生态网络",
+                ),
+                answer_json(1, RESULT_A["text"]),
+            ]
         )
         runner = AgentRunner(
             client=client,
@@ -233,27 +258,73 @@ class AgentFlowTest(unittest.TestCase):
             log_to_db=False,
         )
 
-        result = runner.run("初始问题")
+        result = runner.run("双沙漏模型是什么？")
 
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["search_rounds"], 1)
-        self.assertEqual(result["queries"], ["初始问题"])
-        self.assertEqual(result["answer"]["citation_issues"], [])
-        self.assertEqual(calls, ["初始问题"])
+        self.assertEqual(result["queries"], ["双沙漏 细腰 智能生态网络"])
+        self.assertEqual(result["analysis"]["intent"], "definition")
+        self.assertEqual(calls, ["双沙漏 细腰 智能生态网络"])
+        self.assertEqual(result["step_count"], 3)
         self.assertEqual(
             [s["node"] for s in store.test_steps(result["run_id"])],
-            ["retrieve", "assess", "answer"],
+            ["analyze", "retrieve", "answer"],
         )
         self.assertEqual(len(client.calls), 2)
 
-    def test_insufficient_triggers_second_search(self) -> None:
+    def test_subqueries_are_all_searched_in_one_step(self) -> None:
+        store = MemoryCheckpointStore()
+        search, calls = make_search(
+            {
+                "幻觉治理": [dict(RESULT_A)],
+                "元认知门控": [dict(RESULT_B)],
+                "系统性证伪": [dict(RESULT_C)],
+            }
+        )
+        client = make_client(
+            [
+                analysis_json(
+                    "multi_paper",
+                    "幻觉治理",
+                    sub_queries=["元认知门控", "系统性证伪"],
+                ),
+                answer_json(2, RESULT_B["text"]),
+            ]
+        )
+        runner = AgentRunner(
+            client=client,
+            store=store,
+            search_fn=search,
+            log_to_db=False,
+        )
+
+        result = runner.run("这些论文里，幻觉治理有哪些路线？")
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["search_rounds"], 3)
+        self.assertEqual(
+            result["queries"],
+            ["幻觉治理", "元认知门控", "系统性证伪"],
+        )
+        self.assertEqual(calls, result["queries"])
+        self.assertEqual(len(result["searches"]), 3)
+        self.assertEqual(
+            [s["node"] for s in store.test_steps(result["run_id"])],
+            ["analyze", "retrieve", "answer"],
+        )
+        self.assertEqual(len(result["answer"]["search"]["results"]), 3)
+
+    def test_duplicate_subquery_is_removed(self) -> None:
         store = MemoryCheckpointStore()
         search, calls = make_search()
         client = make_client(
             [
-                assessment(False, next_query="补充问题", missing="缺少实验"),
-                assessment(True),
-                answer_json(2, RESULT_B["text"]),
+                analysis_json(
+                    "fact",
+                    "初始问题",
+                    sub_queries=["初始问题", "初始，问题", "补充角度"],
+                ),
+                answer_json(1, RESULT_A["text"]),
             ]
         )
         runner = AgentRunner(
@@ -266,41 +337,15 @@ class AgentFlowTest(unittest.TestCase):
         result = runner.run("初始问题")
 
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["search_rounds"], 2)
-        self.assertEqual(result["queries"], ["初始问题", "补充问题"])
-        self.assertEqual(len(result["answer"]["search"]["results"]), 2)
-        self.assertEqual(result["answer"]["citation_issues"], [])
-        self.assertEqual(calls, ["初始问题", "补充问题"])
-        self.assertEqual(result["step_count"], 5)
-        self.assertEqual(
-            [s["node"] for s in store.test_steps(result["run_id"])],
-            ["retrieve", "assess", "retrieve", "assess", "answer"],
-        )
-
-    def test_repeated_query_does_not_loop(self) -> None:
-        store = MemoryCheckpointStore()
-        search, calls = make_search()
-        client = make_client(
-            [assessment(False, next_query="初始问题"), answer_json(1, RESULT_A["text"])]
-        )
-        runner = AgentRunner(
-            client=client,
-            store=store,
-            search_fn=search,
-            log_to_db=False,
-        )
-
-        result = runner.run("初始问题")
-
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["search_rounds"], 1)
-        self.assertEqual(calls, ["初始问题"])
-        self.assertEqual(result["assessments"][0]["next_query"], "")
+        self.assertEqual(result["queries"], ["初始问题", "补充角度"])
+        self.assertEqual(calls, ["初始问题", "补充角度"])
 
     def test_no_results_returns_no_evidence_answer(self) -> None:
         store = MemoryCheckpointStore()
         search, calls = make_search()
-        client = make_client([])
+        client = make_client(
+            [analysis_json("fact", "空问题")]
+        )
         runner = AgentRunner(
             client=client,
             store=store,
@@ -313,10 +358,10 @@ class AgentFlowTest(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["answer"]["answer"], NO_EVIDENCE_TEXT)
         self.assertEqual(calls, ["空问题"])
-        self.assertEqual(len(client.calls), 0)
+        self.assertEqual(len(client.calls), 1)
         self.assertEqual(
             [s["node"] for s in store.test_steps(result["run_id"])],
-            ["retrieve", "answer"],
+            ["analyze", "retrieve", "answer"],
         )
 
     def test_resume_from_checkpoint(self) -> None:
@@ -324,7 +369,7 @@ class AgentFlowTest(unittest.TestCase):
         search, calls = make_search()
 
         first_client = make_client(
-            [assessment(False, next_query="补充问题", missing="缺少实验")]
+            [analysis_json("fact", "改写后的问题")]
         )
         first_runner = AgentRunner(
             client=first_client,
@@ -336,10 +381,11 @@ class AgentFlowTest(unittest.TestCase):
         first = first_runner.run("初始问题")
         self.assertEqual(first["status"], "failed")
         self.assertIn("最大步数", first["error"])
-        self.assertEqual(first["phase"], "retrieve")
+        self.assertEqual(first["phase"], "answer")
+        self.assertEqual(first["queries"], ["改写后的问题"])
 
         second_client = make_client(
-            [assessment(True), answer_json(2, RESULT_B["text"])]
+            [answer_json(1, RESULT_A["text"])]
         )
         second_runner = AgentRunner(
             client=second_client,
@@ -354,15 +400,22 @@ class AgentFlowTest(unittest.TestCase):
         self.assertTrue(second["resumed"])
         self.assertEqual(second["run_id"], first["run_id"])
         self.assertEqual(second["status"], "completed")
-        self.assertEqual(second["queries"], ["初始问题", "补充问题"])
-        self.assertEqual(calls, ["初始问题", "补充问题"])
+        self.assertEqual(second["queries"], ["改写后的问题"])
+        self.assertEqual(calls, ["改写后的问题"])
         self.assertEqual(second["answer"]["citation_issues"], [])
+        self.assertEqual(
+            [s["node"] for s in store.test_steps(second["run_id"])],
+            ["analyze", "retrieve", "answer"],
+        )
 
-    def test_trace_contains_steps(self) -> None:
+    def test_trace_contains_three_steps(self) -> None:
         store = MemoryCheckpointStore()
         search, _ = make_search()
         client = make_client(
-            [assessment(True), answer_json(1, RESULT_A["text"])]
+            [
+                analysis_json("fact", "改写后的问题"),
+                answer_json(1, RESULT_A["text"]),
+            ]
         )
         runner = AgentRunner(
             client=client,
@@ -374,22 +427,68 @@ class AgentFlowTest(unittest.TestCase):
         trace = store.trace(result["run_id"])
 
         self.assertIsNotNone(trace)
+        self.assertEqual(
+            [s["node"] for s in trace["steps"]],
+            ["analyze", "retrieve", "answer"],
+        )
         self.assertEqual(len(trace["steps"]), 3)
-        self.assertEqual(trace["steps"][0]["node"], "retrieve")
 
 
-class QueryCleanTest(unittest.TestCase):
-    def test_duplicate_and_empty_queries_are_removed(self) -> None:
-        self.assertEqual(clean_next_query("", ["初始问题"]), "")
+class AnalysisTest(unittest.TestCase):
+    def test_infer_intent_hint(self) -> None:
         self.assertEqual(
-            clean_next_query("初始，问题", ["初始问题"]), ""
+            infer_intent_hint("这些论文里有哪些不同路线？"),
+            "multi_paper",
         )
         self.assertEqual(
-            clean_next_query("换一个角度", ["初始问题"]), "换一个角度"
+            infer_intent_hint("两种方法有什么区别？"),
+            "comparison",
         )
         self.assertEqual(
-            clean_next_query("长" * 121, ["初始问题"]), ""
+            infer_intent_hint("实验一共做了多少组？"),
+            "numeric",
         )
+        self.assertEqual(
+            infer_intent_hint("双沙漏模型是什么？"),
+            "definition",
+        )
+        self.assertEqual(
+            infer_intent_hint("这个方法怎么实现？"),
+            "fact",
+        )
+        self.assertEqual(infer_intent_hint("你好"), "other")
+
+    def test_clean_analysis_limits_and_deduplicates(self) -> None:
+        fact = QueryAnalysis(
+            intent="fact",
+            rewritten_query="A",
+            sub_queries=["B", "C", "A"],
+        )
+        cleaned = clean_analysis(fact, "原问题")
+        self.assertEqual(cleaned.rewritten_query, "A")
+        self.assertEqual(cleaned.sub_queries, ["B"])
+
+        multi = QueryAnalysis(
+            intent="multi_paper",
+            rewritten_query="A",
+            sub_queries=["B", "C", "D", "E", "B"],
+        )
+        cleaned = clean_analysis(multi, "原问题")
+        self.assertEqual(cleaned.sub_queries, ["B", "C", "D"])
+
+    def test_analysis_failure_falls_back_to_original(self) -> None:
+        client = MockClient(
+            caps=Capabilities(json_schema=False, json_object=True),
+            responses=["不是 JSON"] * 3,
+        )
+        analysis, error = analyze_question(
+            "这些论文里有哪些不同路线？",
+            client=client,
+        )
+        self.assertIsNotNone(error)
+        self.assertEqual(analysis.intent, "multi_paper")
+        self.assertEqual(analysis.rewritten_query, "这些论文里有哪些不同路线？")
+        self.assertEqual(analysis.sub_queries, [])
 
 
 if __name__ == "__main__":

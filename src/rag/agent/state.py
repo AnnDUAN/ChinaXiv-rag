@@ -23,31 +23,38 @@ class AgentState(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    version: int = 1
+    version: int = 2
     question: str
     status: AgentStatus = AgentStatus.RUNNING
 
-    # retrieve：还要检索；assess：判断证据；answer：生成回答；done：完成
-    phase: Literal["retrieve", "assess", "answer", "done"] = "retrieve"
+    # analyze：分析意图和改写查询；retrieve：批量执行查询；
+    # answer：生成回答；done：完成。
+    # assess 只为读取旧版 checkpoint 保留，新流程不会进入。
+    phase: Literal[
+        "analyze", "retrieve", "assess", "answer", "done"
+    ] = "analyze"
     step_count: int = 0
     max_steps: int = Field(default=8, ge=1)
 
-    search_rounds: int = 0
-    max_search_rounds: int = Field(default=3, ge=1)
+    # 这里沿用原名字，实际表示“最多执行几次检索查询”。
+    max_search_rounds: int = Field(default=4, ge=1)
+    # 实际执行过的查询数量（改写查询 + 子查询）。
+    search_rounds: int = Field(default=0, ge=0)
     top_k: int = Field(default=5, ge=1)
     mode: str = "hybrid"
     rerank: bool = False
 
-    # 已经用过的检索词，避免模型用同一个问题反复查。
-    queries: list[str] = Field(default_factory=list)
-    pending_query: str | None = None
+    # 问题分析结果：intent、rewritten_query、sub_queries、reason。
+    analysis: dict[str, Any] | None = None
 
-    # 去重后的证据片段；不同轮次的结果都会放在这里。
+    # 已经执行过的查询；pending_queries 是分析后等待执行的查询。
+    queries: list[str] = Field(default_factory=list)
+    pending_queries: list[str] = Field(default_factory=list)
+
+    # 去重后的证据片段；不同查询的结果都会放在这里。
     results: list[dict[str, Any]] = Field(default_factory=list)
-    # 每轮检索的摘要，不存完整正文。
+    # 每次查询的摘要，不存完整正文。
     searches: list[dict[str, Any]] = Field(default_factory=list)
-    # 每次“证据够不够”的判断结果。
-    assessments: list[dict[str, Any]] = Field(default_factory=list)
 
     answer: dict[str, Any] | None = None
     error: str | None = None

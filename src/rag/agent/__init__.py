@@ -1,10 +1,16 @@
-"""Agent 运行时：多轮检索、证据判断、checkpoint。
+"""Agent 运行时：问题分析、批量检索、回答和 checkpoint。
 
-第一版只做一件事：在证据不够时最多补查几轮，然后把结果交给现有问答模块。
-没有自由工具调用、多智能体或后台队列。
+新流程不再做多轮“证据够不够”的判断：
+先分析意图并拆查询，再一次检索所有查询，最后回答。
 """
 
-from .assess import EvidenceAssessment, assess_evidence
+from .analyze import (
+    INTENT_LABELS,
+    QueryAnalysis,
+    analyze_question,
+    clean_analysis,
+    infer_intent_hint,
+)
 from .checkpoint import CheckpointStore, PostgresCheckpointStore
 from .runner import AgentError, AgentRunner
 from .state import AgentState, AgentStatus
@@ -15,7 +21,10 @@ __all__ = [
     "AgentState",
     "AgentStatus",
     "CheckpointStore",
-    "EvidenceAssessment",
+    "INTENT_LABELS",
     "PostgresCheckpointStore",
-    "assess_evidence",
+    "QueryAnalysis",
+    "analyze_question",
+    "clean_analysis",
+    "infer_intent_hint",
 ]
