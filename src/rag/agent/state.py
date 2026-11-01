@@ -28,10 +28,10 @@ class AgentState(BaseModel):
     status: AgentStatus = AgentStatus.RUNNING
 
     # analyze：分析意图和改写查询；retrieve：批量执行查询；
+    # assess：判断证据够不够；web_search：联网搜索；
     # answer：生成回答；done：完成。
-    # assess 只为读取旧版 checkpoint 保留，新流程不会进入。
     phase: Literal[
-        "analyze", "retrieve", "assess", "answer", "done"
+        "analyze", "retrieve", "assess", "web_search", "answer", "done"
     ] = "analyze"
     step_count: int = 0
     max_steps: int = Field(default=8, ge=1)
@@ -46,10 +46,16 @@ class AgentState(BaseModel):
 
     # 问题分析结果：intent、rewritten_query、sub_queries、reason。
     analysis: dict[str, Any] | None = None
+    # 最近一次证据判断结果（只存判断摘要，不存网页正文）。
+    assessment: dict[str, Any] | None = None
 
-    # 已经执行过的查询；pending_queries 是分析后等待执行的查询。
+    # 已经执行过的本地查询；pending_queries 是分析后等待执行的查询。
     queries: list[str] = Field(default_factory=list)
     pending_queries: list[str] = Field(default_factory=list)
+
+    # 联网只允许一次；网页正文放在 Runner 内存里，不进入状态。
+    web_used: bool = False
+    pending_web_query: str | None = None
 
     # 去重后的证据片段；不同查询的结果都会放在这里。
     results: list[dict[str, Any]] = Field(default_factory=list)

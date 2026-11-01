@@ -1,7 +1,7 @@
-"""Agent 运行时：问题分析、批量检索、回答和 checkpoint。
+"""Agent 运行时：问题分析、批量检索、证据判断、可选联网和回答。
 
-新流程不再做多轮“证据够不够”的判断：
-先分析意图并拆查询，再一次检索所有查询，最后回答。
+先分析意图并拆查询，再批量检索本地论文；证据不够时最多联网一次，
+最后基于本地和网页证据回答。网页正文只放在本次运行的内存里。
 """
 
 from .analyze import (
@@ -11,6 +11,7 @@ from .analyze import (
     clean_analysis,
     infer_intent_hint,
 )
+from .assess import EvidenceAssessment, assess_evidence
 from .checkpoint import CheckpointStore, PostgresCheckpointStore
 from .runner import AgentError, AgentRunner
 from .state import AgentState, AgentStatus
@@ -21,10 +22,12 @@ __all__ = [
     "AgentState",
     "AgentStatus",
     "CheckpointStore",
+    "EvidenceAssessment",
     "INTENT_LABELS",
     "PostgresCheckpointStore",
     "QueryAnalysis",
     "analyze_question",
+    "assess_evidence",
     "clean_analysis",
     "infer_intent_hint",
 ]

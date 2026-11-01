@@ -32,20 +32,30 @@ analyze：分析问题
   └─ sub_queries：0～3 个子查询
         ↓
 retrieve：依次执行 rewritten_query 和 sub_queries
-  └─ 按 chunk_id 去重，合并成一个证据池
+  └─ 按 chunk_id 去重，合并成本地证据池
+        ↓
+assess：判断证据够不够
+  ├─ 够 → answer
+  └─ 不够，且已配置联网搜索
+        ↓
+      web_search：调用一次外部 MCP 搜索（例如 Tavily）
+        ↓
+      assess：本地 + 网页证据再看一次
         ↓
 answer：基于证据池生成一次带引用的回答
         ↓
 done
 ```
 
-整个流程固定 3 个步骤：
+本地证据够时是 4 个步骤：
 
 1. `analyze`
 2. `retrieve`
-3. `answer`
+3. `assess`
+4. `answer`
 
-不再在每轮检索后单独判断“证据够不够”。
+需要联网时最多再增加 `web_search` 和一次 `assess`，总共 6 个步骤。
+联网最多一次，失败就退回本地证据回答。
 
 ## 3. 问题怎么分类
 
@@ -138,18 +148,22 @@ answer_question     普通 RAG 的固定组合
 `AgentState` 是完整的运行进度：
 
 - 原始问题；
-- 当前阶段：`analyze` / `retrieve` / `answer` / `done`；
+- 当前阶段：`analyze` / `retrieve` / `assess` / `web_search` / `answer` / `done`；
 - 已执行步数、最大步数；
 - 分析结果：`intent`、`rewritten_query`、`sub_queries`；
-- 已执行查询、等待执行查询；
-- 去重后的证据片段；
-- 每次查询的摘要；
+- 最近一次证据判断结果；
+- 已执行本地查询、等待执行查询；
+- `web_used` 和待执行的联网查询；
+- 去重后的本地证据片段；
+- 每次本地查询的摘要；
 - 最终答案或错误信息；
 - 检索参数：`top_k`、`mode`、`rerank`。
 
 状态整体存进 PostgreSQL 的 JSONB 字段，不依赖进程内存。
 
-旧版 `assess` 阶段只在读取旧 checkpoint 时兼容，新流程不会进入。
+**网页正文不进入 `AgentState`。**
+它只放在 `AgentRunner` 的本次运行内存里，回答完就释放。
+所以 checkpoint 里只有 `web_used` 和查询摘要，没有网页全文。
 
 ## 7. Checkpoint 表
 
@@ -171,7 +185,7 @@ answer_question     普通 RAG 的固定组合
 每一步一行：
 
 - `run_id` + `step_no`：属于哪次运行的第几步；
-- `node`：`analyze` / `retrieve` / `answer`；
+- `node`：`analyze` / `retrieve` / `assess` / `web_search` / `answer`；
 - `status`：`running` / `success` / `failed` / `interrupted`；
 - `input_payload`：这一步的输入摘要；
 - `output_payload`：这一步的输出摘要；
@@ -203,13 +217,16 @@ answer_question     普通 RAG 的固定组合
 ## 9. 命令行
 
 ```powershell
-# 新建一次运行
+# 新建一次运行（本地不够时允许联网）
 .\rag agent ask "问题" --max-steps 8 --max-search-rounds 4
+
+# 禁用联网，只查本地论文
+.\rag agent ask "问题" --no-web-search
 
 # 列出最近的运行
 .\rag agent list
 
-# 查看每一步：分析、检索、回答
+# 查看每一步：分析、检索、判断、联网、回答
 .\rag agent trace 1
 
 # 中断后继续；可以顺便提高最大步数
@@ -232,17 +249,23 @@ Agent 不会接管所有问题，避免简单问题也变慢、变贵。
 - 多个子查询会在一个检索步骤里全部执行；
 - 重复子查询会被去掉；
 - 没有检索结果时直接返回“信息不足”；
+- 证据不足时最多联网一次；
+- 已经联网过就不会再次请求联网；
+- 联网结果只存在内存，不进入 checkpoint；
 - 步数不够时失败，`resume` 后能完成；
-- trace 能看到 `analyze → retrieve → answer`；
+- trace 能看到 `analyze → retrieve → assess → answer`，联网时多两步；
 - 分析失败时退回原问题；
-- 意图规则兜底和子查询数量限制。
+- 意图规则兜底和子查询数量限制；
+- MCP 参数组装、结果去重和网页来源提示。
 
 ## 11. 当前限制
 
-- 意图分类和查询改写质量取决于模型；
+- 意图分类、查询改写和证据判断质量取决于模型；
 - 多论文归纳仍然只靠一次检索 + 多子查询，没有真正逐篇阅读；
-- 没有并发控制，同一 `run_id` 不要同时开两个进程 `resume`；
-- 还没有用真实大模型系统评测新流程和普通 `rag ask` 的差异。
+- 网页正文不持久化，进程中断后续跑会丢掉上次网页结果；
+- 网页内容可能有误、过期或包含提示词注入，需要保留 URL 并人工核对；
+- 还没有用真实大模型和真实 Tavily Key 做系统评测；
+- 没有并发控制，同一 `run_id` 不要同时开两个进程 `resume`。
 
 下一步更值得做的是：用复杂测试集比较普通 RAG、旧版 Agent 和新版 Agent 的
 答案质量、检索覆盖和耗时，而不是继续加工具数量。

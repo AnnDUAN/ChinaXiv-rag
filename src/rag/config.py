@@ -15,6 +15,7 @@ INDEX_DIR = DATA_DIR / "index"
 CONFIG_DIR = ROOT / "config"
 PAPERS_CONFIG = CONFIG_DIR / "papers.json"
 LLM_CONFIG = CONFIG_DIR / "llm.json"
+WEB_SEARCH_CONFIG = CONFIG_DIR / "web_search.json"
 DB_SCHEMA = Path(__file__).resolve().parent / "db" / "schema.sql"
 
 # 默认连接 docker-compose.yml 里的独立数据库；

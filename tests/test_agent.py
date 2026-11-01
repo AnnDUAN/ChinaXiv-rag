@@ -10,9 +10,11 @@ from rag.agent import (
     AgentRunner,
     QueryAnalysis,
     analyze_question,
+    assess_evidence,
     clean_analysis,
     infer_intent_hint,
 )
+from rag.agent.assess import clean_web_query
 from rag.llm import Capabilities, MockClient
 from rag.generation.answer import NO_EVIDENCE_TEXT
 
@@ -50,6 +52,16 @@ RESULT_C = {
     "page_start": 3,
     "page_end": 3,
     "text": "这是另一个子查询找到的证据。",
+}
+
+WEB_RESULT = {
+    "source_type": "web",
+    "title": "最新网页",
+    "url": "https://example.com/news",
+    "text": "这是联网搜索找到的最新信息。",
+    "score": 0.9,
+    "published_at": "2026-10-31",
+    "retrieved_at": "2026-11-01T10:00:00+00:00",
 }
 
 
@@ -195,6 +207,25 @@ def analysis_json(
     )
 
 
+def assessment_json(
+    sufficient: bool,
+    *,
+    next_action: str = "answer",
+    missing: str = "",
+    web_query: str = "",
+) -> str:
+    return json.dumps(
+        {
+            "sufficient": sufficient,
+            "missing": missing,
+            "next_action": next_action,
+            "web_query": web_query,
+            "reason": "测试判断",
+        },
+        ensure_ascii=False,
+    )
+
+
 def answer_json(source_id: int, quote: str) -> str:
     return json.dumps(
         {
@@ -238,6 +269,17 @@ def make_search(mapping: dict[str, list[dict[str, Any]]] | None = None):
     return search, calls
 
 
+def make_web_search(results: list[dict[str, Any]] | None = None):
+    calls: list[str] = []
+    payload = [dict(item) for item in (results or [WEB_RESULT])]
+
+    def search(query: str, **kwargs: Any) -> list[dict[str, Any]]:
+        calls.append(query)
+        return [dict(item) for item in payload]
+
+    return search, calls
+
+
 class AgentFlowTest(unittest.TestCase):
     def test_analysis_rewrites_and_searches_once(self) -> None:
         store = MemoryCheckpointStore()
@@ -248,6 +290,7 @@ class AgentFlowTest(unittest.TestCase):
                     "single",
                     "双沙漏 细腰 智能生态网络",
                 ),
+                assessment_json(True),
                 answer_json(1, RESULT_A["text"]),
             ]
         )
@@ -265,12 +308,12 @@ class AgentFlowTest(unittest.TestCase):
         self.assertEqual(result["queries"], ["双沙漏 细腰 智能生态网络"])
         self.assertEqual(result["analysis"]["intent"], "single")
         self.assertEqual(calls, ["双沙漏 细腰 智能生态网络"])
-        self.assertEqual(result["step_count"], 3)
+        self.assertEqual(result["step_count"], 4)
         self.assertEqual(
             [s["node"] for s in store.test_steps(result["run_id"])],
-            ["analyze", "retrieve", "answer"],
+            ["analyze", "retrieve", "assess", "answer"],
         )
-        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(len(client.calls), 3)
 
     def test_subqueries_are_all_searched_in_one_step(self) -> None:
         store = MemoryCheckpointStore()
@@ -288,6 +331,7 @@ class AgentFlowTest(unittest.TestCase):
                     "幻觉治理",
                     sub_queries=["元认知门控", "系统性证伪"],
                 ),
+                assessment_json(True),
                 answer_json(2, RESULT_B["text"]),
             ]
         )
@@ -310,7 +354,7 @@ class AgentFlowTest(unittest.TestCase):
         self.assertEqual(len(result["searches"]), 3)
         self.assertEqual(
             [s["node"] for s in store.test_steps(result["run_id"])],
-            ["analyze", "retrieve", "answer"],
+            ["analyze", "retrieve", "assess", "answer"],
         )
         self.assertEqual(len(result["answer"]["search"]["results"]), 3)
 
@@ -324,6 +368,7 @@ class AgentFlowTest(unittest.TestCase):
                     "初始问题",
                     sub_queries=["初始问题", "初始，问题", "补充角度"],
                 ),
+                assessment_json(True),
                 answer_json(1, RESULT_A["text"]),
             ]
         )
@@ -361,7 +406,7 @@ class AgentFlowTest(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(
             [s["node"] for s in store.test_steps(result["run_id"])],
-            ["analyze", "retrieve", "answer"],
+            ["analyze", "retrieve", "assess", "answer"],
         )
 
     def test_resume_from_checkpoint(self) -> None:
@@ -369,13 +414,16 @@ class AgentFlowTest(unittest.TestCase):
         search, calls = make_search()
 
         first_client = make_client(
-            [analysis_json("single", "改写后的问题")]
+            [
+                analysis_json("single", "改写后的问题"),
+                assessment_json(True),
+            ]
         )
         first_runner = AgentRunner(
             client=first_client,
             store=store,
             search_fn=search,
-            max_steps=2,
+            max_steps=3,
             log_to_db=False,
         )
         first = first_runner.run("初始问题")
@@ -405,15 +453,61 @@ class AgentFlowTest(unittest.TestCase):
         self.assertEqual(second["answer"]["citation_issues"], [])
         self.assertEqual(
             [s["node"] for s in store.test_steps(second["run_id"])],
-            ["analyze", "retrieve", "answer"],
+            ["analyze", "retrieve", "assess", "answer"],
         )
 
-    def test_trace_contains_three_steps(self) -> None:
+    def test_web_failure_falls_back_to_local(self) -> None:
+        store = MemoryCheckpointStore()
+        search, _ = make_search()
+
+        def failing_web_search(query: str, **kwargs: Any):
+            raise RuntimeError("MCP 超时")
+
+        client = make_client(
+            [
+                analysis_json("single", "最新网页信息"),
+                assessment_json(
+                    False,
+                    next_action="web_search",
+                    web_query="2026 最新网页信息",
+                ),
+                answer_json(1, RESULT_A["text"]),
+            ]
+        )
+        runner = AgentRunner(
+            client=client,
+            store=store,
+            search_fn=search,
+            web_search_fn=failing_web_search,
+            log_to_db=False,
+        )
+
+        result = runner.run("最新网页信息是什么？")
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["web_used"])
+        self.assertEqual(
+            [s["node"] for s in store.test_steps(result["run_id"])],
+            [
+                "analyze",
+                "retrieve",
+                "assess",
+                "web_search",
+                "answer",
+            ],
+        )
+        self.assertEqual(
+            result["answer"]["search"]["results"][0]["source_type"],
+            "local",
+        )
+
+    def test_trace_contains_four_steps(self) -> None:
         store = MemoryCheckpointStore()
         search, _ = make_search()
         client = make_client(
             [
                 analysis_json("single", "改写后的问题"),
+                assessment_json(True),
                 answer_json(1, RESULT_A["text"]),
             ]
         )
@@ -429,9 +523,64 @@ class AgentFlowTest(unittest.TestCase):
         self.assertIsNotNone(trace)
         self.assertEqual(
             [s["node"] for s in trace["steps"]],
-            ["analyze", "retrieve", "answer"],
+            ["analyze", "retrieve", "assess", "answer"],
         )
-        self.assertEqual(len(trace["steps"]), 3)
+        self.assertEqual(len(trace["steps"]), 4)
+
+    def test_insufficient_evidence_uses_web_once(self) -> None:
+        store = MemoryCheckpointStore()
+        search, _ = make_search()
+        web_search, web_calls = make_web_search()
+        client = make_client(
+            [
+                analysis_json("single", "最新网页信息"),
+                assessment_json(
+                    False,
+                    next_action="web_search",
+                    missing="缺少最新信息",
+                    web_query="2026 最新网页信息",
+                ),
+                assessment_json(True),
+                answer_json(2, WEB_RESULT["text"]),
+            ]
+        )
+        runner = AgentRunner(
+            client=client,
+            store=store,
+            search_fn=search,
+            web_search_fn=web_search,
+            log_to_db=False,
+        )
+
+        result = runner.run("最新网页信息是什么？")
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["web_used"])
+        self.assertEqual(web_calls, ["2026 最新网页信息"])
+        self.assertEqual(
+            [s["node"] for s in store.test_steps(result["run_id"])],
+            [
+                "analyze",
+                "retrieve",
+                "assess",
+                "web_search",
+                "assess",
+                "answer",
+            ],
+        )
+        result_types = [
+            item["source_type"]
+            for item in result["answer"]["search"]["results"]
+        ]
+        self.assertEqual(result_types, ["local", "web"])
+        self.assertEqual(
+            result["answer"]["sources"][1]["url"],
+            WEB_RESULT["url"],
+        )
+        self.assertEqual(runner._web_results, {})
+
+        state = store.runs[result["run_id"]]["state"]
+        self.assertNotIn(WEB_RESULT["text"], str(state.results))
 
 
 class AnalysisTest(unittest.TestCase):
@@ -497,6 +646,63 @@ class AnalysisTest(unittest.TestCase):
         self.assertEqual(analysis.intent, "multi_paper")
         self.assertEqual(analysis.rewritten_query, "这些论文里有哪些不同路线？")
         self.assertEqual(analysis.sub_queries, [])
+
+
+class AssessmentTest(unittest.TestCase):
+    def test_no_results_requests_web_once(self) -> None:
+        client = make_client([])
+        assessment, error = assess_evidence(
+            "最新消息",
+            [],
+            [],
+            client=client,
+            web_used=False,
+            web_available=True,
+        )
+        self.assertIsNone(error)
+        self.assertFalse(assessment.sufficient)
+        self.assertEqual(assessment.next_action, "web_search")
+        self.assertEqual(assessment.web_query, "最新消息")
+
+    def test_no_results_gives_up_without_web(self) -> None:
+        client = make_client([])
+        assessment, error = assess_evidence(
+            "最新消息",
+            [],
+            [],
+            client=client,
+            web_used=False,
+            web_available=False,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(assessment.next_action, "give_up")
+
+    def test_web_already_used_cannot_request_web_again(self) -> None:
+        client = make_client(
+            [
+                assessment_json(
+                    False,
+                    next_action="web_search",
+                    web_query="再查一次",
+                )
+            ]
+        )
+        assessment, error = assess_evidence(
+            "最新消息",
+            [RESULT_A],
+            ["本地查询"],
+            client=client,
+            web_used=True,
+            web_available=True,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(assessment.next_action, "give_up")
+        self.assertEqual(assessment.web_query, "")
+
+    def test_clean_web_query(self) -> None:
+        self.assertEqual(clean_web_query("  2026  最新  消息 "), "2026 最新 消息")
+        self.assertEqual(clean_web_query(""), "")
+        self.assertEqual(clean_web_query("长" * 161), "")
 
 
 if __name__ == "__main__":

@@ -10,8 +10,9 @@ __pycache__/
 data/*
 !data/README.md
 
-# 本地大模型配置可能包含 API Key，只提交示例文件
+# 本地大模型和联网搜索配置可能包含 API Key，只提交示例文件
 config/llm.json
+config/web_search.json
 
 # 个人简历和临时文件
 *.docx

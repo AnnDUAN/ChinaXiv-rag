@@ -13,6 +13,7 @@ dependencies = [
   "numpy>=1.26",
   "fastembed>=0.4",
   "openai>=1.40",
+  "mcp>=2.0",
   "pydantic>=2.7",
   "psycopg[binary]>=3.1",
   "pgvector>=0.2",

@@ -510,7 +510,15 @@ analyze：分析问题
         ↓
 retrieve：批量执行改写查询和子查询，按切片去重
         ↓
-answer：基于合并后的证据生成一次带引用的回答
+assess：判断证据够不够
+  ├─ 够 → answer
+  └─ 不够，且已配置联网搜索
+        ↓
+      web_search：调用一次外部 MCP 搜索
+        ↓
+      assess：再看一次证据
+        ↓
+      answer：基于本地 + 网页证据生成带引用的回答
 ```
 
 意图只分三类：
@@ -523,14 +531,40 @@ answer：基于合并后的证据生成一次带引用的回答
 
 - 用户口语和论文用词对不上；
 - 一个问题需要换几个角度查；
-- 多论文问题需要拆成多个子问题。
+- 多论文问题需要拆成多个子问题；
+- 本地论文不够时，可以补一次联网搜索。
 
-它不会自由调用网页、代码等工具，也不会循环补查：
+限制：
 
-- 固定 3 个步骤：`analyze`、`retrieve`、`answer`；
-- 最多执行 4 次检索（`--max-search-rounds`）；
+- 最多执行 4 次本地检索（`--max-search-rounds`）；
+- 最多联网 1 次，失败就退回本地回答；
 - 重复的查询和空查询会自动去掉；
 - 分析失败时退回原问题，不阻塞后续检索。
+
+### 可选：联网搜索（Tavily MCP）
+
+联网搜索默认开启，但只有配置了 MCP 地址后才会真正发起请求。
+
+```powershell
+# 复制示例配置，填入 Tavily API Key
+copy config\web_search.example.json config\web_search.json
+```
+
+也可以不写配置文件，直接用环境变量：
+
+```powershell
+$env:TAVILY_API_KEY = "你的 key"
+# 或完整的远程 MCP 地址
+$env:RAG_WEB_SEARCH_URL = "https://mcp.tavily.com/mcp/?tavilyApiKey=你的 key"
+```
+
+行为：
+
+- 先查本地论文；
+- 本地证据不够时才调用一次 Tavily MCP；
+- 网页正文只存在本次运行的内存里，不写入本地索引和数据库；
+- 回答里会区分本地论文和网页来源，并显示网页 URL；
+- 不想联网时加 `--no-web-search`。
 
 运行前先更新数据库表结构：
 
@@ -589,7 +623,9 @@ Agent 每次运行都会写两张表：
 - 部分预印本版式比较特殊：标题可能跨行、章节没有编号、某一页几乎全是图，解析结果会出现在 `quality.warnings` 里；
 - ChinaXiv 的“计算机科学”分类里有少量论文同时挂在其他学科下，主题可能偏交叉；
 - 默认混合检索；没有向量索引时会自动退回 BM25，不依赖在线服务；
-- Agent 检索是实验功能，默认不启用；它只做问题分析、查询改写和多查询检索，不能浏览网页或执行代码；
+- Agent 检索是实验功能，默认不启用；它只做问题分析、查询改写、多查询检索和可选的 MCP 联网搜索，不能执行代码；
+- 联网搜索需要你自己配置 Tavily MCP 和 API Key；网页结果只用于本次回答，不缓存、不写入论文索引；
+- 网页内容可能有误、过期或包含提示词注入，回答里会保留 URL，使用前要核对原始来源；
 - Agent 的复杂问题效果还没有用真实大模型做系统评测，目前只做了离线流程测试和本地假模型冒烟测试。
 
 ## 目录结构
@@ -602,6 +638,7 @@ agentic_rag/
   rag.cmd / rag.sh          命令行包装
   config/papers.json        论文补充信息
   config/llm.json           大模型接口配置（可选）
+  config/web_search.example.json  Tavily MCP 联网搜索配置示例
   data/                     数据（PDF、JSON、模型、pgdata）
   src/rag/
     cli.py                  命令行入口
@@ -637,8 +674,11 @@ agentic_rag/
     agent/                  检索 Agent
       state.py              运行状态
       analyze.py            判断意图、改写查询、拆子问题
-      runner.py             分析 → 批量检索 → 回答
+      assess.py             判断证据够不够、是否联网
+      runner.py             分析 → 检索 → 判断 → 可选联网 → 回答
       checkpoint.py         把运行状态和每一步存进 PostgreSQL
+    web/
+      mcp_search.py         通过外部 MCP 搜索网页（只保留在内存）
   tests/questions.json      旧版 20 个基础验收问题（16 篇语料时期）
   tests/questions_hard.json 旧版 20 个口语化难题（16 篇语料时期）
   tests/questions_40.json   43 篇时期的 21 个直接问法问题

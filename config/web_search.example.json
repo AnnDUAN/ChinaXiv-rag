@@ -1,0 +1,6 @@
+{
+  "url": "https://mcp.tavily.com/mcp/?tavilyApiKey=你的 Tavily API Key",
+  "tool": "tavily-search",
+  "timeout": 20,
+  "max_results": 5
+}

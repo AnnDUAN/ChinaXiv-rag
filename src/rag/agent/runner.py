@@ -1,10 +1,13 @@
 """一个小而快的检索 Agent。
 
-流程只有三步：
-analyze（分析意图和拆查询）→ retrieve（批量检索）→ answer（回答）→ done
+流程：
+analyze（分析意图和拆查询）
+  → retrieve（批量查本地论文）
+  → assess（判断证据够不够）
+      ├─ 够 → answer
+      └─ 不够 → web_search（最多一次）→ assess → answer
 
-和旧版相比，不再在每轮检索后让模型判断“证据够不够”，
-而是在开头一次性决定要查哪些查询，减少大模型调用和等待时间。
+网页正文只放在本次运行的 Runner 内存里，不进入 AgentState 或数据库。
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from ..generation.answer import NO_EVIDENCE_TEXT, answer_from_search
 from ..llm import LLMClient, LLMConfig, build_client
 from ..retrieval.search import search_chunks
 from .analyze import analyze_question
+from .assess import assess_evidence
 from .checkpoint import CheckpointStore, PostgresCheckpointStore
 from .state import AgentState, AgentStatus
 
@@ -44,6 +48,7 @@ class AgentRunner:
         llm_config: LLMConfig | None = None,
         store: CheckpointStore | None = None,
         search_fn: Callable[..., dict[str, Any]] | None = None,
+        web_search_fn: Callable[..., list[dict[str, Any]]] | None = None,
         answer_fn: Callable[..., dict[str, Any]] | None = None,
         max_steps: int = 8,
         max_search_rounds: int = 4,
@@ -51,12 +56,14 @@ class AgentRunner:
         mode: str = "hybrid",
         rerank: bool = False,
         max_evidence: int = 12,
+        enable_web_search: bool = True,
         log_to_db: bool = True,
     ) -> None:
         self.client = client
         self.llm_config = llm_config
         self.store = store or PostgresCheckpointStore()
         self.search_fn = search_fn or search_chunks
+        self.web_search_fn = web_search_fn
         self.answer_fn = answer_fn or answer_from_search
         self.max_steps = max(1, max_steps)
         self.max_search_rounds = max(1, max_search_rounds)
@@ -64,7 +71,12 @@ class AgentRunner:
         self.mode = mode
         self.rerank = rerank
         self.max_evidence = max(1, max_evidence)
+        self.enable_web_search = enable_web_search
         self.log_to_db = log_to_db
+
+        # 网页正文只存在这里，不进入 AgentState。
+        self._web_results: dict[int, list[dict[str, Any]]] = {}
+        self._web_available_cache: bool | None = None
 
     # ------------------------------------------------------------------
     # 入口
@@ -151,8 +163,9 @@ class AgentRunner:
             elif state.phase == "retrieve":
                 self._retrieve(run_id, state)
             elif state.phase == "assess":
-                # 兼容旧 checkpoint；新流程不再做单独的证据判断。
-                state.phase = "answer"
+                self._assess(run_id, state)
+            elif state.phase == "web_search":
+                self._web_search(run_id, state)
             elif state.phase == "answer":
                 self._answer(run_id, state)
             else:
@@ -216,7 +229,7 @@ class AgentRunner:
     def _retrieve(self, run_id: int, state: AgentState) -> None:
         queries = [query for query in state.pending_queries if query.strip()]
         if not queries:
-            state.phase = "answer"
+            state.phase = "assess"
             self.store.save(run_id, state)
             return
 
@@ -299,7 +312,7 @@ class AgentRunner:
         state.pending_queries = []
         state.search_rounds = len(state.queries)
         state.searches.extend(searches)
-        state.phase = "answer"
+        state.phase = "assess"
         state.step_count = step_no
         state.error = None
 
@@ -311,23 +324,153 @@ class AgentRunner:
         self.store.finish_step(step_id, "success", output=summary)
         self.store.save(run_id, state)
 
+    def _assess(self, run_id: int, state: AgentState) -> None:
+        step_no = state.step_count + 1
+        web_results = self._web_results.get(run_id, [])
+        combined = [*state.results, *web_results]
+        step_id = self.store.start_step(
+            run_id,
+            step_no,
+            "assess",
+            {
+                "evidence_count": len(combined),
+                "local_count": len(state.results),
+                "web_count": len(web_results),
+                "web_used": state.web_used,
+            },
+        )
+        try:
+            assessment, assessment_error = assess_evidence(
+                state.question,
+                combined,
+                state.queries,
+                client=self._get_client(),
+                web_used=state.web_used,
+                web_available=self._web_available(),
+                max_evidence=self.max_evidence,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.store.finish_step(step_id, "failed", error=str(exc))
+            raise
+
+        state.assessment = assessment.model_dump()
+        if assessment_error:
+            state.assessment["error"] = _short(
+                assessment_error, 300
+            )
+
+        if assessment.sufficient:
+            state.phase = "answer"
+            state.pending_web_query = None
+        elif (
+            assessment.next_action == "web_search"
+            and not state.web_used
+            and self._web_available()
+        ):
+            state.phase = "web_search"
+            state.pending_web_query = (
+                assessment.web_query or state.question
+            )
+        else:
+            state.phase = "answer"
+            state.pending_web_query = None
+
+        state.step_count = step_no
+        state.error = None
+        output = {
+            "sufficient": assessment.sufficient,
+            "missing": assessment.missing,
+            "next_action": assessment.next_action,
+            "web_query": assessment.web_query,
+            "reason": assessment.reason,
+        }
+        if assessment_error:
+            output["error"] = _short(assessment_error, 300)
+        self.store.finish_step(step_id, "success", output=output)
+        self.store.save(run_id, state)
+
+    def _web_search(self, run_id: int, state: AgentState) -> None:
+        query = (state.pending_web_query or state.question).strip()
+        step_no = state.step_count + 1
+        step_id = self.store.start_step(
+            run_id,
+            step_no,
+            "web_search",
+            {"query": query, "top_k": state.top_k},
+        )
+        try:
+            web_search = self._get_web_search()
+            results = web_search(query, top_k=self.top_k)
+        except Exception as exc:  # noqa: BLE001
+            # 联网失败不影响本地回答。
+            state.web_used = True
+            state.pending_web_query = None
+            state.phase = "answer"
+            state.step_count = step_no
+            state.error = None
+            self.store.finish_step(
+                step_id,
+                "success",
+                output={
+                    "query": query,
+                    "result_count": 0,
+                    "error": _short(str(exc), 300),
+                },
+            )
+            self.store.save(run_id, state)
+            return
+
+        if isinstance(results, dict):
+            results = [results]
+        normalized = []
+        for item in results or []:
+            if not isinstance(item, dict):
+                continue
+            copied = dict(item)
+            copied.setdefault("source_type", "web")
+            normalized.append(copied)
+
+        self._web_results[run_id] = normalized[: self.max_evidence]
+        state.web_used = True
+        state.pending_web_query = None
+        state.phase = "assess"
+        state.step_count = step_no
+        state.error = None
+        self.store.finish_step(
+            step_id,
+            "success",
+            output={
+                "query": query,
+                "result_count": len(normalized),
+            },
+        )
+        self.store.save(run_id, state)
+
     def _answer(self, run_id: int, state: AgentState) -> None:
+        web_results = self._web_results.get(run_id, [])
+        local_limit = max(0, self.max_evidence - len(web_results))
+        combined = [
+            *state.results[:local_limit],
+            *web_results,
+        ][: self.max_evidence]
+
         step_no = state.step_count + 1
         step_id = self.store.start_step(
             run_id,
             step_no,
             "answer",
             {
-                "evidence_count": len(state.results),
+                "evidence_count": len(combined),
+                "local_count": len(state.results),
+                "web_count": len(web_results),
                 "search_rounds": state.search_rounds,
             },
         )
         try:
             evidence = []
-            for index, item in enumerate(
-                state.results[: self.max_evidence], 1
-            ):
+            for index, item in enumerate(combined, 1):
                 copied = dict(item)
+                copied.setdefault("source_type", "local")
                 copied["rank"] = index
                 evidence.append(copied)
 
@@ -343,6 +486,7 @@ class AgentRunner:
                 "agent_sub_queries": analysis.get("sub_queries") or [],
                 "agent_rounds": state.search_rounds,
                 "agent_queries": list(state.queries),
+                "agent_web_used": state.web_used,
             }
 
             if not evidence:
@@ -377,6 +521,7 @@ class AgentRunner:
         state.pending_queries = []
         state.step_count = step_no
         state.error = None
+        self._web_results.pop(run_id, None)
 
         structured = payload.get("structured") or {}
         output = {
@@ -385,6 +530,7 @@ class AgentRunner:
             "citation_count": len(structured.get("citations") or []),
             "citation_issues": payload.get("citation_issues") or [],
             "structured_error": payload.get("structured_error"),
+            "web_used": state.web_used,
         }
         self.store.finish_step(step_id, "success", output=output)
         self.store.save(run_id, state)
@@ -394,6 +540,27 @@ class AgentRunner:
         if self.client is None:
             self.client = build_client(self.llm_config)
         return self.client
+
+    def _get_web_search(self) -> Callable[..., list[dict[str, Any]]]:
+        if self.web_search_fn is None:
+            from ..web import MCPWebSearch
+
+            self.web_search_fn = MCPWebSearch.from_config().search
+        return self.web_search_fn
+
+    def _web_available(self) -> bool:
+        if not self.enable_web_search:
+            return False
+        if self.web_search_fn is not None:
+            return True
+        if self._web_available_cache is None:
+            try:
+                from ..web import web_search_available
+
+                self._web_available_cache = web_search_available()
+            except Exception:
+                self._web_available_cache = False
+        return self._web_available_cache
 
     @staticmethod
     def _result(
@@ -410,6 +577,8 @@ class AgentRunner:
             "step_count": state.step_count,
             "search_rounds": state.search_rounds,
             "analysis": state.analysis,
+            "assessment": state.assessment,
+            "web_used": state.web_used,
             "queries": list(state.queries),
             "searches": list(state.searches),
             "answer": state.answer,

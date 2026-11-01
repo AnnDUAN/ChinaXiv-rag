@@ -344,10 +344,13 @@ def _print_answer_payload(payload: dict) -> None:
     print(payload["answer"])
     print("\n出处：")
     for source in payload.get("sources", []):
-        print(
+        line = (
             f"  [{source['rank']}] 《{source['title']}》 "
             f"{source['pages']} | {source['section']}"
         )
+        if source.get("url"):
+            line += f" | {source['url']}"
+        print(line)
 
     structured = payload.get("structured")
     if structured:
@@ -572,6 +575,19 @@ def _print_agent_result(result: dict) -> None:
         if analysis.get("error"):
             print(f"⚠ 分析失败，已改用原问题：{analysis['error']}")
 
+    assessment = result.get("assessment") or {}
+    if assessment:
+        verdict = "证据足够" if assessment.get("sufficient") else "证据不足"
+        missing = assessment.get("missing")
+        if missing:
+            verdict += f"（缺：{missing}）"
+        print(f"证据判断：{verdict}")
+        if assessment.get("error"):
+            print(f"⚠ 证据判断失败：{assessment['error']}")
+    print(
+        "联网搜索：已使用" if result.get("web_used") else "联网搜索：未使用"
+    )
+
     for search in result.get("searches") or []:
         print(
             f"  检索：{search.get('query')} | "
@@ -670,6 +686,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
                 top_k=args.k,
                 mode=args.mode,
                 rerank=args.rerank,
+                enable_web_search=args.web_search,
             )
             result = runner.run(args.query)
         except Exception as exc:  # noqa: BLE001
@@ -691,7 +708,10 @@ def cmd_agent(args: argparse.Namespace) -> int:
 
     if args.agent_command == "resume":
         try:
-            runner = AgentRunner(store=store)
+            runner = AgentRunner(
+                store=store,
+                enable_web_search=args.web_search,
+            )
             result = runner.run(
                 resume_run_id=args.run_id,
                 max_steps=args.max_steps,
@@ -1044,7 +1064,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-search-rounds",
         type=int,
         default=4,
-        help="最多执行几次检索（改写查询 + 子查询），默认 4",
+        help="最多执行几次本地检索（改写查询 + 子查询），默认 4",
+    )
+    agent_ask.add_argument(
+        "--web-search",
+        dest="web_search",
+        action="store_true",
+        default=True,
+        help="本地证据不足时允许调用 MCP 联网搜索（默认开启）",
+    )
+    agent_ask.add_argument(
+        "--no-web-search",
+        dest="web_search",
+        action="store_false",
+        help="禁用联网搜索",
     )
     agent_ask.add_argument("--json", action="store_true")
     agent_ask.set_defaults(func=cmd_agent)
@@ -1059,7 +1092,20 @@ def build_parser() -> argparse.ArgumentParser:
     agent_resume.add_argument(
         "--max-search-rounds",
         type=int,
-        help="可选：覆盖原来的最大检索查询数",
+        help="可选：覆盖原来的最大本地检索查询数",
+    )
+    agent_resume.add_argument(
+        "--web-search",
+        dest="web_search",
+        action="store_true",
+        default=True,
+        help="本地证据不足时允许调用 MCP 联网搜索（默认开启）",
+    )
+    agent_resume.add_argument(
+        "--no-web-search",
+        dest="web_search",
+        action="store_false",
+        help="禁用联网搜索",
     )
     agent_resume.add_argument("--json", action="store_true")
     agent_resume.set_defaults(func=cmd_agent)
