@@ -19,9 +19,30 @@ from .bm25 import BM25, tokenize
 KEYWORD_FILE = config.INDEX_DIR / "jieba_bm25.json"
 
 
-def _signature(chunks: list[dict[str, Any]]) -> str:
-    ids = sorted(c.get("chunk_id", "") for c in chunks)
-    return hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()[:16]
+def bm25_text(chunk: dict[str, Any]) -> str:
+    """正文 BM25 使用的文本：章节路径 + 正文。
+
+    论文标题不塞进每个切片，而是检索时单独算一个标题 BM25 分，
+    避免同一篇论文的每个章节都因为标题而整体前移。
+    """
+    section = " ".join(chunk.get("section_path") or [])
+    return " ".join(
+        part for part in (section, chunk.get("text", "")) if part
+    )
+
+
+def index_signature(chunks: list[dict[str, Any]]) -> str:
+    # 不只签 chunk_id，也签参与 BM25 的文本。
+    # 这样标题或正文变了，旧索引会自己失效。
+    rows = sorted(
+        (
+            str(chunk.get("chunk_id", "")),
+            bm25_text(chunk),
+        )
+        for chunk in chunks
+    )
+    payload = "\n".join(f"{chunk_id}\t{text}" for chunk_id, text in rows)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def build_keyword_index(
@@ -34,16 +55,13 @@ def build_keyword_index(
     if not searchable:
         raise ValueError("没有可检索的切片。")
 
-    signature = _signature(searchable)
+    signature = index_signature(searchable)
     if KEYWORD_FILE.exists() and not force:
         old = json.loads(KEYWORD_FILE.read_text(encoding="utf-8"))
         if old.get("chunk_signature") == signature:
             return {**old, "skipped": True}
 
-    texts = [
-        " ".join(c.get("section_path", [])) + " " + c.get("text", "")
-        for c in searchable
-    ]
+    texts = [bm25_text(c) for c in searchable]
     tokens = [tokenize(t) for t in texts]
     bm25 = BM25(tokens)
 
@@ -88,5 +106,6 @@ def index_status(chunks: list[dict[str, Any]]) -> dict[str, Any]:
         "vocab": len(index.get("df", {})),
         "avgdl": index.get("avgdl"),
         "built_at": index.get("built_at"),
-        "up_to_date": index.get("chunk_signature") == _signature(searchable),
+        "up_to_date": index.get("chunk_signature")
+        == index_signature(searchable),
     }

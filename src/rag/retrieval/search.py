@@ -4,18 +4,29 @@ from __future__ import annotations
 
 import json
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from .. import config
 from ..indexing.bm25 import BM25, QUERY_SYNONYMS, TOPIC_ALIASES, tokenize
+from ..indexing.keyword_index import (
+    bm25_text,
+    index_signature,
+    load_keyword_index,
+)
+
+
+@lru_cache(maxsize=2048)
+def _title_tokens(title: str) -> set[str]:
+    return set(tokenize(title))
 
 
 def _topic_overlap(query_terms: set[str], title: str) -> float:
     """问题词有多少落在论文标题（含中英文别名）里。"""
     if not query_terms:
         return 0.0
-    title_tokens = set(tokenize(title))
+    title_tokens = _title_tokens(title)
     hit = 0
     for term in query_terms:
         if term in title_tokens or any(alias in title for alias in TOPIC_ALIASES.get(term, [])):
@@ -105,6 +116,39 @@ def _semantic_conf(cosine: float) -> float:
     return max(0.0, min(1.0, (cosine - 0.30) / 0.40))
 
 
+NUMERIC_QUERY_RE = re.compile(
+    r"\d|多少|几组|几个|几种|几类|指标|准确率|召回率|F1|mAP|mIoU|"
+    r"mDice|AUC|百分比|%|参数|规模|数量"
+)
+
+
+def _is_numeric_query(query: str) -> bool:
+    """问题是不是在问数字、指标或实验规模。"""
+    return bool(NUMERIC_QUERY_RE.search(query))
+
+
+def _numeric_density(text: str) -> bool:
+    """粗略判断一个切片是不是数字密集。"""
+    clean = re.sub(r"<[^>]+>", " ", text or "")
+    digits = len(re.findall(r"\d", clean))
+    if digits < config.NUMERIC_MIN_DIGITS:
+        return False
+    return digits / max(len(clean.strip()), 1) >= config.NUMERIC_DIGIT_RATIO
+
+
+def _score_boost(doc: dict[str, Any], numeric_query: bool) -> float:
+    """给表格和数字密集切片一点额外权重。"""
+    boost = 1.0
+    if doc.get("type") == "table":
+        boost *= config.TABLE_SCORE_BOOST
+    if numeric_query and (
+        doc.get("type") == "table"
+        or _numeric_density(doc.get("text", ""))
+    ):
+        boost *= config.NUMERIC_SCORE_BOOST
+    return boost
+
+
 def _select_diverse(
     docs: list[dict[str, Any]],
     ranked: list[int],
@@ -114,8 +158,16 @@ def _select_diverse(
     """按顺序选结果，跳过同一章节里重复或相邻的切片。"""
     selected: list[int] = []
     selected_tokens: list[set[str]] = []
+    paper_counts: dict[str, int] = {}
     for idx in ranked:
         doc = docs[idx]
+        paper_id = str(doc.get("paper_id") or "")
+        if (
+            paper_id
+            and paper_counts.get(paper_id, 0)
+            >= config.MAX_CHUNKS_PER_PAPER
+        ):
+            continue
         redundant = False
         for pos, chosen_idx in enumerate(selected):
             chosen = docs[chosen_idx]
@@ -139,6 +191,8 @@ def _select_diverse(
             continue
         selected.append(idx)
         selected_tokens.append(set(doc_tokens[idx]))
+        if paper_id:
+            paper_counts[paper_id] = paper_counts.get(paper_id, 0) + 1
         if len(selected) >= limit:
             break
     return selected
@@ -157,8 +211,6 @@ def _context_factor(
     """
     factor = 1.0
     title_overlap = _topic_overlap(q_set, doc.get("paper_title", ""))
-    if title_overlap:
-        factor *= 1.01
     if doc.get("type") == "abstract":
         if definitional and title_overlap >= 0.5:
             factor *= 1.25
@@ -186,6 +238,7 @@ def search_chunks(
     # 关键词块只是标签列表，不作为答案段落参与检索
     docs = [d for d in docs if d.get("type") != "keywords"]
     query_tokens = tokenize(query)
+    numeric_query = _is_numeric_query(query)
     if not docs:
         return {"query": query, "query_tokens": query_tokens, "results": [], "error": "还没有入库任何切片，先运行 build。"}
     if not query_tokens:
@@ -196,14 +249,10 @@ def search_chunks(
     # 没有索引或索引过期时，现场用 jieba 分词。
     doc_tokens: list[list[str]] | None = None
     try:
-        from ..indexing.keyword_index import load_keyword_index
-
         keyword_index = load_keyword_index()
     except Exception:
         keyword_index = None
-    if keyword_index and set(keyword_index.get("chunk_ids", [])) == {
-        d.get("chunk_id", "") for d in docs
-    }:
+    if keyword_index and keyword_index.get("chunk_signature") == index_signature(docs):
         row_of = {
             chunk_id: row
             for row, chunk_id in enumerate(keyword_index["chunk_ids"])
@@ -212,10 +261,7 @@ def search_chunks(
             keyword_index["tokens"][row_of[d["chunk_id"]]] for d in docs
         ]
     if doc_tokens is None:
-        doc_tokens = [
-            tokenize(" ".join(d.get("section_path", [])) + " " + d.get("text", ""))
-            for d in docs
-        ]
+        doc_tokens = [tokenize(bm25_text(d)) for d in docs]
     bm25 = BM25(doc_tokens)
     # 口语词在原文里不存在时，换成原文更可能用的说法
     expanded_tokens: list[str] = []
@@ -236,6 +282,23 @@ def search_chunks(
     expanded_tokens = list(dict.fromkeys(expanded_tokens))
     query_for_score = expanded_tokens or query_tokens
 
+    # 论文标题单独算一个 BM25 字段：同一篇论文的所有切片共享同一个标题分，
+    # 只提升整篇论文，不改变论文内部章节的先后顺序。
+    title_tokens_by_paper: dict[str, list[str]] = {}
+    for doc in docs:
+        paper_id = str(doc.get("paper_id") or "")
+        if paper_id not in title_tokens_by_paper:
+            title_tokens_by_paper[paper_id] = tokenize(
+                doc.get("paper_title", "")
+            )
+    title_ids = list(title_tokens_by_paper)
+    title_bm25 = BM25(
+        [title_tokens_by_paper[paper_id] for paper_id in title_ids]
+    )
+    title_score_by_paper = dict(
+        zip(title_ids, title_bm25.scores(query_for_score))
+    )
+
     base_scores = bm25.scores(query_for_score)
     q_set = set(query_for_score)
     definitional = _is_definitional(query)
@@ -249,7 +312,11 @@ def search_chunks(
     coverage_by_doc: list[float] = []
     matched_by_doc: list[list[str]] = []
     for i, doc in enumerate(docs):
-        score = base_scores[i]
+        paper_id = str(doc.get("paper_id") or "")
+        score = base_scores[i] + (
+            config.TITLE_BM25_WEIGHT
+            * title_score_by_paper.get(paper_id, 0.0)
+        )
         matched = q_set & set(doc_tokens[i])
         matched_by_doc.append(sorted(matched))
         coverage = sum(effective.get(t, 0.0) for t in matched) / idf_sum
@@ -265,10 +332,10 @@ def search_chunks(
             if len(re.findall(r"[（(]\d{1,2}[）)]", doc.get("text", ""))) >= 4:
                 score *= 0.9
             score *= _phrase_bonus(query_for_score, doc.get("text", ""))
-            title_overlap = _topic_overlap(q_set, doc.get("paper_title", ""))
-            if title_overlap:
-                score *= 1.02
             if doc.get("type") == "abstract":
+                title_overlap = _topic_overlap(
+                    q_set, doc.get("paper_title", "")
+                )
                 # 只有“问题问的就是这篇论文的主题”时，才把摘要顶上来
                 score *= 1.8 if (definitional and title_overlap >= 0.5) else 1.08
         bm25_scores.append(score)
@@ -397,6 +464,7 @@ def search_chunks(
     # ---------- 3. 合并排序 ----------
     scores = [0.0] * len(docs)
     conf_scores = list(coverage_by_doc)
+    keyword_anchor_indices: set[int] = set()
 
     # 重排序需要比最终 top_k 更大的候选池。
     # 多取一倍，给去重留出余量，最终再交给重排序模型。
@@ -405,8 +473,16 @@ def search_chunks(
         rank_limit = max(rank_limit, config.RERANK_CANDIDATES * 2)
 
     if effective_mode == "bm25":
-        ranked = bm25_ranked[:rank_limit]
-        scores = list(bm25_scores)
+        scores = [
+            bm25_scores[i]
+            * _score_boost(docs[i], numeric_query)
+            for i in range(len(docs))
+        ]
+        ranked = sorted(
+            [i for i in range(len(docs)) if scores[i] > 0],
+            key=lambda i: scores[i],
+            reverse=True,
+        )[:rank_limit]
 
     elif effective_mode == "vector":
         assert vector_scores is not None
@@ -416,8 +492,12 @@ def search_chunks(
             reverse=True,
         )[:rank_limit]
         for i in ranked:
-            scores[i] = vector_scores[i] * _context_factor(
-                docs[i], q_set, query_for_score, definitional
+            scores[i] = (
+                vector_scores[i]
+                * _context_factor(
+                    docs[i], q_set, query_for_score, definitional
+                )
+                * _score_boost(docs[i], numeric_query)
             )
         ranked.sort(key=lambda i: scores[i], reverse=True)
         conf_scores = [_semantic_conf(v) for v in vector_scores]
@@ -446,6 +526,7 @@ def search_chunks(
         }
 
         candidates = sorted(set(bm25_rank) | set(vector_rank))
+        anchored_papers: set[str] = set()
         for i in candidates:
             rrf_score = 0.0
             if i in bm25_rank:
@@ -456,7 +537,25 @@ def search_chunks(
                 rrf_score += config.RRF_VECTOR_WEIGHT / (
                     config.RRF_K + vector_rank[i]
                 )
-            scores[i] = rrf_score
+            # 强关键词命中保底：BM25 前 10 且问题词覆盖够高时，
+            # 额外加一点 BM25 名次分。每篇论文只保底一次，
+            # 避免一篇论文的多个切片一起被抬高。
+            paper_id = str(docs[i].get("paper_id") or "")
+            if (
+                i in bm25_rank
+                and bm25_rank[i] <= config.KEYWORD_ANCHOR_TOP_N
+                and coverage_by_doc[i]
+                >= config.KEYWORD_ANCHOR_COVERAGE
+                and paper_id not in anchored_papers
+            ):
+                rrf_score += config.KEYWORD_ANCHOR_WEIGHT / (
+                    config.RRF_K + bm25_rank[i]
+                )
+                keyword_anchor_indices.add(i)
+                anchored_papers.add(paper_id)
+            scores[i] = rrf_score * _score_boost(
+                docs[i], numeric_query
+            )
 
         ranked = sorted(candidates, key=lambda i: scores[i], reverse=True)
         conf_scores = [
@@ -549,6 +648,7 @@ def search_chunks(
                 ),
                 "rank_before_rerank": rank_before_rerank.get(idx),
                 "rerank_anchor": idx in rerank_anchor_indices,
+                "keyword_anchor": idx in keyword_anchor_indices,
                 "chunk_id": doc.get("chunk_id", ""),
                 "paper_id": doc.get("paper_id", ""),
                 "paper_title": doc.get("paper_title", ""),

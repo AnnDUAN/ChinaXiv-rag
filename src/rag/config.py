@@ -37,6 +37,8 @@ BM25_K1 = 1.5
 BM25_B = 0.75
 RECALL_N = 20
 DEFAULT_TOP_K = 5
+# 最终结果里同一篇论文最多保留几块，避免标题很匹配的论文刷屏。
+MAX_CHUNKS_PER_PAPER = 2
 
 # 向量检索参数
 EMBED_MODEL = "BAAI/bge-small-zh-v1.5"
@@ -52,6 +54,22 @@ PGVECTOR_EXACT = True
 RRF_K = 60
 RRF_BM25_WEIGHT = 0.5
 RRF_VECTOR_WEIGHT = 0.5
+
+# 强关键词保底：BM25 前几名且问题词覆盖够高时，额外加一点 BM25 名次分，
+# 避免正确答案被 RRF 融合稀释。
+KEYWORD_ANCHOR_TOP_N = 10
+KEYWORD_ANCHOR_COVERAGE = 0.30
+KEYWORD_ANCHOR_WEIGHT = 0.35
+
+# 论文标题单独算一个 BM25 字段，给正文分数加一点标题分。
+# 这样只提升整篇论文，不改变同一篇论文内部章节的相对顺序。
+TITLE_BM25_WEIGHT = 0.35
+
+# 表格和数字密集切片的轻微加权。
+TABLE_SCORE_BOOST = 1.03
+NUMERIC_SCORE_BOOST = 1.06
+NUMERIC_MIN_DIGITS = 6
+NUMERIC_DIGIT_RATIO = 0.02
 
 # 重排序参数
 # 本地交叉编码器：把“问题 + 候选段落”放在一起判断相关性。
