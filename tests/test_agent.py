@@ -395,6 +395,7 @@ class AgentFlowTest(unittest.TestCase):
             client=client,
             store=store,
             search_fn=search,
+            enable_web_search=False,
             log_to_db=False,
         )
 
@@ -610,28 +611,44 @@ class AnalysisTest(unittest.TestCase):
     def test_clean_analysis_limits_and_deduplicates(self) -> None:
         single = QueryAnalysis(
             intent="single",
-            rewritten_query="A",
-            sub_queries=["B", "C", "A"],
+            rewritten_query="甲",
+            sub_queries=["乙", "丙", "甲"],
         )
         cleaned = clean_analysis(single, "原问题")
-        self.assertEqual(cleaned.rewritten_query, "A")
+        self.assertEqual(cleaned.rewritten_query, "甲")
         self.assertEqual(cleaned.sub_queries, [])
 
         comparison = QueryAnalysis(
             intent="comparison",
-            rewritten_query="A",
-            sub_queries=["B", "C", "D", "A", "B"],
+            rewritten_query="甲",
+            sub_queries=["乙", "丙", "丁", "甲", "乙"],
         )
         cleaned = clean_analysis(comparison, "原问题")
-        self.assertEqual(cleaned.sub_queries, ["B", "C"])
+        self.assertEqual(cleaned.sub_queries, ["乙", "丙"])
 
         multi = QueryAnalysis(
             intent="multi_paper",
-            rewritten_query="A",
-            sub_queries=["B", "C", "D", "E", "B"],
+            rewritten_query="甲",
+            sub_queries=["乙", "丙", "丁", "戊", "乙"],
         )
         cleaned = clean_analysis(multi, "原问题")
-        self.assertEqual(cleaned.sub_queries, ["B", "C", "D"])
+        self.assertEqual(cleaned.sub_queries, ["乙", "丙", "丁"])
+
+    def test_chinese_question_rejects_english_rewrite(self) -> None:
+        analysis = QueryAnalysis(
+            intent="single",
+            rewritten_query="HolisticaQuant architecture layers components",
+            sub_queries=["English only query"],
+        )
+        cleaned = clean_analysis(
+            analysis,
+            "HolisticaQuant 的立体架构由哪几层组成？",
+        )
+        self.assertEqual(
+            cleaned.rewritten_query,
+            "HolisticaQuant 的立体架构由哪几层组成？",
+        )
+        self.assertEqual(cleaned.sub_queries, [])
 
     def test_analysis_failure_falls_back_to_original(self) -> None:
         client = MockClient(

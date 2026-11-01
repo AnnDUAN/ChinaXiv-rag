@@ -45,6 +45,8 @@ ANALYZE_SYSTEM_PROMPT = """你是检索前的问题分析器，只做三件事�
      综述、分别有哪些工作”，需要跨论文归纳。
 3. rewritten_query 要保留原文里的专有名词、模型名、系统名和英文缩写；
    补上论文里常见的同义说法，写成简短、具体的检索词，不要写成空泛的问句。
+   如果原问题是中文，rewritten_query 必须用中文写；专有名词可以保留英文，
+   但不要把整句翻译成英文。
 4. sub_queries 的要求：
    - single：不要给子查询；
    - comparison：给 1～2 个，分别覆盖对比对象；
@@ -80,6 +82,10 @@ def _normalize(text: str) -> str:
     return re.sub(r"[\s，。！？、；：,.!?;:（）()【】\[\]]+", "", text).lower()
 
 
+def _has_chinese(text: str) -> bool:
+    return bool(re.search(r"[一-鿿]", text or ""))
+
+
 def _clean_query(value: str, *, max_chars: int = 120) -> str:
     query = " ".join((value or "").split()).strip()
     if len(query) > max_chars:
@@ -109,6 +115,9 @@ def clean_analysis(
     rewritten = _clean_query(analysis.rewritten_query)
     if not rewritten:
         rewritten = question.strip()
+    # 中文问题不要被模型整句翻成英文，否则中文论文库很难命中。
+    if _has_chinese(question) and not _has_chinese(rewritten):
+        rewritten = question.strip()
 
     max_sub = {
         "single": 0,
@@ -121,6 +130,8 @@ def clean_analysis(
         for value in analysis.sub_queries:
             query = _clean_query(value)
             if not query:
+                continue
+            if _has_chinese(question) and not _has_chinese(query):
                 continue
             key = _normalize(query)
             if key in seen:
