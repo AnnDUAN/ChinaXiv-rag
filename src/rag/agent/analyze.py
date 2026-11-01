@@ -19,45 +19,36 @@ from ..llm import (
 )
 
 Intent = Literal[
-    "definition",
-    "fact",
-    "numeric",
+    "single",
     "comparison",
     "multi_paper",
-    "follow_up",
-    "other",
 ]
 
 INTENT_LABELS = {
-    "definition": "定义/概念",
-    "fact": "事实/方法",
-    "numeric": "数字/指标",
+    "single": "单篇问题",
     "comparison": "对比",
     "multi_paper": "多论文归纳",
-    "follow_up": "追问",
-    "other": "其他",
 }
 
 ANALYZE_SYSTEM_PROMPT = """你是检索前的问题分析器，只做三件事：
 1. 判断用户问题的意图；
 2. 把问题改写成更适合论文检索的查询；
-3. 必要时把复杂问题拆成 1～3 个子问题。
+3. 必要时把复杂问题拆成子问题。
 
 规则：
 1. 不要回答问题，不要使用任何论文内容。
 2. intent 只能从下面的值里选一个：
-   - definition：问“是什么、定义、概念、含义、指什么”
-   - fact：问原理、机制、方法、流程、原因、作用、怎么做
-   - numeric：问数量、规模、参数、指标、实验结果、百分比
-   - comparison：问两种方法/两篇论文/两个方案的区别、优劣、对比
-   - multi_paper：问“这些论文、有哪些路线、分几类、综述、分别有哪些工作”
-   - follow_up：依赖前文或上一轮的追问
-   - other：以上都不明显
+   - single：单篇问题。问定义、概念、原理、机制、方法、流程、
+     数字、指标、追问或其他普通问题，都归到这一类；
+   - comparison：两个方法/两篇论文/两个方案的区别、优劣、对比；
+   - multi_paper：问题里出现“这些论文、有哪些路线、分几类、
+     综述、分别有哪些工作”，需要跨论文归纳。
 3. rewritten_query 要保留原文里的专有名词、模型名、系统名和英文缩写；
    补上论文里常见的同义说法，写成简短、具体的检索词，不要写成空泛的问句。
 4. sub_queries 的要求：
-   - comparison 和 multi_paper：给 2～3 个，分别覆盖对比对象或不同路线；
-   - 其他意图：最多给 1 个，通常留空；
+   - single：不要给子查询；
+   - comparison：给 1～2 个，分别覆盖对比对象；
+   - multi_paper：给 2～3 个，分别覆盖不同路线或不同方面；
    - 不要重复 rewritten_query，不要写“相关研究”“综述”这种空泛查询。
 5. 如果问题里有明确实体，改写时必须保留实体，不能只写主题词。
 6. 只输出符合 schema 的 JSON。"""
@@ -75,8 +66,8 @@ class QueryAnalysis(BaseModel):
     sub_queries: list[str] = Field(
         default_factory=list,
         description=(
-            "复杂问题拆出的子查询；comparison/multi_paper 给 2～3 个，"
-            "其他意图最多 1 个。"
+            "复杂问题拆出的子查询；single 不给，comparison 给 1～2 个，"
+            "multi_paper 给 2～3 个。"
         ),
     )
     reason: str = Field(
@@ -106,21 +97,7 @@ def infer_intent_hint(question: str) -> Intent:
         return "multi_paper"
     if re.search(r"区别|差异|对比|比较|相比|谁更好|优劣|vs\.?|VS", question):
         return "comparison"
-    if re.search(
-        r"多少|几组|几个|几种|几类|指标|准确率|召回率|F1|mAP|mIoU|"
-        r"mDice|AUC|百分比|%|参数|规模|数量",
-        question,
-    ):
-        return "numeric"
-    if re.search(r"是什么|什么是|定义|概念|含义|指什么|指的是", question):
-        return "definition"
-    if re.search(
-        r"怎么|如何|为什么|原理|机制|方法|流程|原因|作用|影响|"
-        r"解决|实现",
-        question,
-    ):
-        return "fact"
-    return "other"
+    return "single"
 
 
 def clean_analysis(
@@ -129,29 +106,29 @@ def clean_analysis(
 ) -> QueryAnalysis:
     """清理模型输出：去重、限长、限制子查询数量。"""
     intent = analysis.intent
-    if intent == "other":
-        hint = infer_intent_hint(question)
-        if hint != "other":
-            intent = hint
-
     rewritten = _clean_query(analysis.rewritten_query)
     if not rewritten:
         rewritten = question.strip()
 
-    max_sub = 3 if intent in {"comparison", "multi_paper"} else 1
+    max_sub = {
+        "single": 0,
+        "comparison": 2,
+        "multi_paper": 3,
+    }[intent]
     seen = {_normalize(rewritten), _normalize(question)}
     sub_queries: list[str] = []
-    for value in analysis.sub_queries:
-        query = _clean_query(value)
-        if not query:
-            continue
-        key = _normalize(query)
-        if key in seen:
-            continue
-        seen.add(key)
-        sub_queries.append(query)
-        if len(sub_queries) >= max_sub:
-            break
+    if max_sub > 0:
+        for value in analysis.sub_queries:
+            query = _clean_query(value)
+            if not query:
+                continue
+            key = _normalize(query)
+            if key in seen:
+                continue
+            seen.add(key)
+            sub_queries.append(query)
+            if len(sub_queries) >= max_sub:
+                break
 
     return analysis.model_copy(
         update={

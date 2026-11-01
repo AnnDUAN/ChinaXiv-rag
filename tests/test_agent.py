@@ -245,7 +245,7 @@ class AgentFlowTest(unittest.TestCase):
         client = make_client(
             [
                 analysis_json(
-                    "definition",
+                    "single",
                     "双沙漏 细腰 智能生态网络",
                 ),
                 answer_json(1, RESULT_A["text"]),
@@ -263,7 +263,7 @@ class AgentFlowTest(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["search_rounds"], 1)
         self.assertEqual(result["queries"], ["双沙漏 细腰 智能生态网络"])
-        self.assertEqual(result["analysis"]["intent"], "definition")
+        self.assertEqual(result["analysis"]["intent"], "single")
         self.assertEqual(calls, ["双沙漏 细腰 智能生态网络"])
         self.assertEqual(result["step_count"], 3)
         self.assertEqual(
@@ -320,7 +320,7 @@ class AgentFlowTest(unittest.TestCase):
         client = make_client(
             [
                 analysis_json(
-                    "fact",
+                    "comparison",
                     "初始问题",
                     sub_queries=["初始问题", "初始，问题", "补充角度"],
                 ),
@@ -344,7 +344,7 @@ class AgentFlowTest(unittest.TestCase):
         store = MemoryCheckpointStore()
         search, calls = make_search()
         client = make_client(
-            [analysis_json("fact", "空问题")]
+            [analysis_json("single", "空问题")]
         )
         runner = AgentRunner(
             client=client,
@@ -369,7 +369,7 @@ class AgentFlowTest(unittest.TestCase):
         search, calls = make_search()
 
         first_client = make_client(
-            [analysis_json("fact", "改写后的问题")]
+            [analysis_json("single", "改写后的问题")]
         )
         first_runner = AgentRunner(
             client=first_client,
@@ -413,7 +413,7 @@ class AgentFlowTest(unittest.TestCase):
         search, _ = make_search()
         client = make_client(
             [
-                analysis_json("fact", "改写后的问题"),
+                analysis_json("single", "改写后的问题"),
                 answer_json(1, RESULT_A["text"]),
             ]
         )
@@ -446,27 +446,35 @@ class AnalysisTest(unittest.TestCase):
         )
         self.assertEqual(
             infer_intent_hint("实验一共做了多少组？"),
-            "numeric",
+            "single",
         )
         self.assertEqual(
             infer_intent_hint("双沙漏模型是什么？"),
-            "definition",
+            "single",
         )
         self.assertEqual(
             infer_intent_hint("这个方法怎么实现？"),
-            "fact",
+            "single",
         )
-        self.assertEqual(infer_intent_hint("你好"), "other")
+        self.assertEqual(infer_intent_hint("你好"), "single")
 
     def test_clean_analysis_limits_and_deduplicates(self) -> None:
-        fact = QueryAnalysis(
-            intent="fact",
+        single = QueryAnalysis(
+            intent="single",
             rewritten_query="A",
             sub_queries=["B", "C", "A"],
         )
-        cleaned = clean_analysis(fact, "原问题")
+        cleaned = clean_analysis(single, "原问题")
         self.assertEqual(cleaned.rewritten_query, "A")
-        self.assertEqual(cleaned.sub_queries, ["B"])
+        self.assertEqual(cleaned.sub_queries, [])
+
+        comparison = QueryAnalysis(
+            intent="comparison",
+            rewritten_query="A",
+            sub_queries=["B", "C", "D", "A", "B"],
+        )
+        cleaned = clean_analysis(comparison, "原问题")
+        self.assertEqual(cleaned.sub_queries, ["B", "C"])
 
         multi = QueryAnalysis(
             intent="multi_paper",
